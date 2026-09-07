@@ -29,7 +29,7 @@ var import_ws = require("ws");
 var import_genai2 = require("@google/genai");
 var import_dotenv = __toESM(require("dotenv"), 1);
 var fs9 = __toESM(require("fs"), 1);
-var import_node_crypto10 = require("node:crypto");
+var import_node_crypto11 = require("node:crypto");
 var import_promises8 = __toESM(require("node:dns/promises"), 1);
 var import_node_net2 = __toESM(require("node:net"), 1);
 var import_node_child_process = require("node:child_process");
@@ -1247,10 +1247,130 @@ function clamp4(value) {
   return Math.max(0, Math.min(1, value));
 }
 
-// cognition/goalManager.ts
+// cognition/errorProtocol.ts
+var import_node_fs = require("node:fs");
+var import_node_path = require("node:path");
 var import_node_crypto4 = require("node:crypto");
+var SEVERITY_IMPORTANCE = {
+  transient: 0.3,
+  degraded: 0.55,
+  critical: 0.85
+};
+var ErrorProtocol = class {
+  constructor(options) {
+    this.options = options;
+    this.maxRecords = options.maxRecords ?? 200;
+    this.errorLogPath = (0, import_node_path.join)(options.dataDir, "errors.log");
+  }
+  records = [];
+  maxRecords;
+  errorLogPath;
+  installed = false;
+  /** Record an error, persist it, and (if important enough) publish it. */
+  report(input) {
+    const record = {
+      id: (0, import_node_crypto4.randomUUID)(),
+      timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+      severity: input.severity,
+      scope: input.scope,
+      message: input.message,
+      detail: input.detail,
+      recoverable: input.recoverable ?? input.severity !== "critical"
+    };
+    this.records.push(record);
+    if (this.records.length > this.maxRecords) {
+      this.records.splice(0, this.records.length - this.maxRecords);
+    }
+    this.appendLog(record);
+    const importance = SEVERITY_IMPORTANCE[input.severity];
+    if (this.options.publishEvent && importance >= 0.3) {
+      try {
+        this.options.publishEvent({
+          type: `system.core_error_${record.severity}`,
+          source: "system",
+          importance,
+          confidence: 1,
+          dedupeKey: `${record.scope}:${record.message}`.slice(0, 180),
+          metadata: {
+            errorId: record.id,
+            scope: record.scope,
+            message: record.message.slice(0, 400),
+            recoverable: record.recoverable
+          }
+        });
+      } catch {
+      }
+    }
+    if (record.severity === "critical" && this.options.onCritical) {
+      try {
+        this.options.onCritical(record);
+      } catch {
+      }
+    }
+    return record;
+  }
+  /** Wrap an async subsystem operation so faults become protocol records. */
+  guard(scope, operation) {
+    return operation().catch((error) => {
+      this.report({
+        severity: "degraded",
+        scope,
+        message: error instanceof Error ? error.message : String(error),
+        detail: error instanceof Error ? error.stack || void 0 : void 0
+      });
+      return null;
+    });
+  }
+  recent(limit = 50) {
+    return this.records.slice(-Math.max(1, Math.min(limit, this.maxRecords))).reverse();
+  }
+  summary() {
+    const bySeverity = { transient: 0, degraded: 0, critical: 0 };
+    for (const record of this.records) bySeverity[record.severity] += 1;
+    return { total: this.records.length, bySeverity, last: this.records[this.records.length - 1] || null };
+  }
+  /**
+   * Install process-level guards exactly once. An uncaught exception is
+   * logged and recorded, then the process exits with code 20 so a supervisor
+   * (Electron shell, WMI task, watchdog) can restart it — matching the
+   * fail-fast contract. Unhandled rejections are treated as degraded faults
+   * and do not kill the process.
+   */
+  installProcessGuards() {
+    if (this.installed) return;
+    this.installed = true;
+    process.on("uncaughtException", (error) => {
+      this.report({
+        severity: "critical",
+        scope: "process.uncaughtException",
+        message: error.message,
+        detail: error.stack,
+        recoverable: false
+      });
+      setTimeout(() => process.exit(20), 150);
+    });
+    process.on("unhandledRejection", (reason) => {
+      this.report({
+        severity: "degraded",
+        scope: "process.unhandledRejection",
+        message: reason instanceof Error ? reason.message : String(reason),
+        detail: reason instanceof Error ? reason.stack : void 0
+      });
+    });
+  }
+  appendLog(record) {
+    try {
+      (0, import_node_fs.appendFileSync)(this.errorLogPath, `${JSON.stringify(record)}
+`, "utf8");
+    } catch {
+    }
+  }
+};
+
+// cognition/goalManager.ts
+var import_node_crypto5 = require("node:crypto");
 var import_promises2 = __toESM(require("node:fs/promises"), 1);
-var import_node_path = __toESM(require("node:path"), 1);
+var import_node_path2 = __toESM(require("node:path"), 1);
 var GoalManager = class {
   constructor(filePath, maxTasks = 50) {
     this.filePath = filePath;
@@ -1261,7 +1381,7 @@ var GoalManager = class {
   writeQueue = Promise.resolve();
   async initialize() {
     if (this.loaded) return;
-    await import_promises2.default.mkdir(import_node_path.default.dirname(this.filePath), { recursive: true });
+    await import_promises2.default.mkdir(import_node_path2.default.dirname(this.filePath), { recursive: true });
     try {
       const parsed = JSON.parse(await import_promises2.default.readFile(this.filePath, "utf-8"));
       this.goals = Array.isArray(parsed.goals) ? parsed.goals : [];
@@ -1295,7 +1415,7 @@ var GoalManager = class {
     const timestamp = (/* @__PURE__ */ new Date()).toISOString();
     const rawTasks = (input.tasks || []).slice(0, this.maxTasks);
     const tasks = rawTasks.map((task) => ({
-      id: task.id?.trim() || (0, import_node_crypto4.randomUUID)(),
+      id: task.id?.trim() || (0, import_node_crypto5.randomUUID)(),
       title: task.title.trim(),
       status: task.status || "pending",
       priority: clamp5(task.priority ?? 0.5),
@@ -1310,7 +1430,7 @@ var GoalManager = class {
     }));
     validateTaskGraph(tasks);
     const goal = {
-      id: (0, import_node_crypto4.randomUUID)(),
+      id: (0, import_node_crypto5.randomUUID)(),
       objective,
       constraints: unique(input.constraints || []),
       successCriteria: unique(input.successCriteria || []),
@@ -1351,7 +1471,7 @@ var GoalManager = class {
     const rawTasks = (plannedTasks || []).slice(0, this.maxTasks);
     if (!rawTasks.length) throw new Error("A goal plan must contain at least one task.");
     const tasks = rawTasks.map((task) => ({
-      id: task.id?.trim() || (0, import_node_crypto4.randomUUID)(),
+      id: task.id?.trim() || (0, import_node_crypto5.randomUUID)(),
       title: task.title.trim(),
       status: "pending",
       priority: clamp5(task.priority ?? 0.5),
@@ -1603,7 +1723,7 @@ var SpeechOrchestrator = class {
 };
 
 // cognition/modelRouter.ts
-var import_node_crypto5 = require("node:crypto");
+var import_node_crypto6 = require("node:crypto");
 var ModelRouter = class {
   constructor(options) {
     this.options = options;
@@ -1622,7 +1742,7 @@ var ModelRouter = class {
     this.enforceRateLimit();
     const models = this.routes[input.capability].filter(Boolean);
     if (!models.length) throw new Error(`No model configured for capability '${input.capability}'.`);
-    const key = input.cacheKey || (0, import_node_crypto5.createHash)("sha256").update(`${input.capability}\0${prompt}`).digest("hex");
+    const key = input.cacheKey || (0, import_node_crypto6.createHash)("sha256").update(`${input.capability}\0${prompt}`).digest("hex");
     const cached = this.cache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
       return {
@@ -1779,7 +1899,7 @@ function shouldRepeatIdlePresence(lastIdlePresenceAt, now2 = Date.now(), cooldow
 
 // cognition/runtime.ts
 var import_promises5 = __toESM(require("node:fs/promises"), 1);
-var import_node_path4 = __toESM(require("node:path"), 1);
+var import_node_path5 = __toESM(require("node:path"), 1);
 
 // cognition/situationModel.ts
 var now = () => (/* @__PURE__ */ new Date()).toISOString();
@@ -1964,9 +2084,9 @@ function asRiskLevel(value) {
 }
 
 // cognition/skillManager.ts
-var import_node_crypto6 = require("node:crypto");
+var import_node_crypto7 = require("node:crypto");
 var import_promises3 = __toESM(require("node:fs/promises"), 1);
-var import_node_path2 = __toESM(require("node:path"), 1);
+var import_node_path3 = __toESM(require("node:path"), 1);
 var SkillManager = class {
   constructor(filePath) {
     this.filePath = filePath;
@@ -1976,7 +2096,7 @@ var SkillManager = class {
   writeQueue = Promise.resolve();
   async initialize() {
     if (this.loaded) return;
-    await import_promises3.default.mkdir(import_node_path2.default.dirname(this.filePath), { recursive: true });
+    await import_promises3.default.mkdir(import_node_path3.default.dirname(this.filePath), { recursive: true });
     try {
       const parsed = JSON.parse(await import_promises3.default.readFile(this.filePath, "utf-8"));
       this.skills = Array.isArray(parsed.skills) ? parsed.skills : [];
@@ -2012,7 +2132,7 @@ var SkillManager = class {
       return structuredClone(existing);
     }
     const skill = {
-      id: (0, import_node_crypto6.randomUUID)(),
+      id: (0, import_node_crypto7.randomUUID)(),
       name,
       description: input.description.trim(),
       preconditions: unique2(input.preconditions || []),
@@ -2095,9 +2215,9 @@ function clamp7(value) {
 }
 
 // cognition/structuredMemory.ts
-var import_node_crypto7 = require("node:crypto");
+var import_node_crypto8 = require("node:crypto");
 var import_promises4 = __toESM(require("node:fs/promises"), 1);
-var import_node_path3 = __toESM(require("node:path"), 1);
+var import_node_path4 = __toESM(require("node:path"), 1);
 var StructuredMemoryStore = class {
   constructor(filePath) {
     this.filePath = filePath;
@@ -2107,7 +2227,7 @@ var StructuredMemoryStore = class {
   writeQueue = Promise.resolve();
   async initialize(legacy = []) {
     if (this.loaded) return;
-    await import_promises4.default.mkdir(import_node_path3.default.dirname(this.filePath), { recursive: true });
+    await import_promises4.default.mkdir(import_node_path4.default.dirname(this.filePath), { recursive: true });
     try {
       const parsed = JSON.parse(await import_promises4.default.readFile(this.filePath, "utf-8"));
       this.memories = Array.isArray(parsed.memories) ? parsed.memories : [];
@@ -2146,7 +2266,7 @@ var StructuredMemoryStore = class {
         continue;
       }
       this.memories.push({
-        id: (0, import_node_crypto7.randomUUID)(),
+        id: (0, import_node_crypto8.randomUUID)(),
         kind: legacyKind(memory.category),
         content: memory.text.trim(),
         projectId: memory.category === "project" ? inferProject(memory.text) : null,
@@ -2197,7 +2317,7 @@ var StructuredMemoryStore = class {
       return structuredClone(duplicate);
     }
     const memory = {
-      id: (0, import_node_crypto7.randomUUID)(),
+      id: (0, import_node_crypto8.randomUUID)(),
       kind: input.kind,
       content,
       projectId,
@@ -2347,14 +2467,14 @@ var CognitiveRuntime = class {
     this.config = options.config || loadCognitionConfig();
     this.events = new CognitiveEventBus(this.config.limits.maxRecentEvents * 5);
     this.situation = new SituationModel(this.config.limits.maxRecentEvents, {
-      currentProject: options.projectRoot ? import_node_path4.default.basename(options.projectRoot) : null,
+      currentProject: options.projectRoot ? import_node_path5.default.basename(options.projectRoot) : null,
       autonomyPaused: this.config.autonomyPaused,
       state: this.config.autonomyPaused ? "PAUSED" : "IDLE"
     });
-    const cognitionDir = import_node_path4.default.join(options.dataDir, "cognition");
-    this.memories = new StructuredMemoryStore(import_node_path4.default.join(cognitionDir, "memories.v1.json"));
-    this.goals = new GoalManager(import_node_path4.default.join(cognitionDir, "goals.v1.json"));
-    this.skills = new SkillManager(import_node_path4.default.join(cognitionDir, "skills.v1.json"));
+    const cognitionDir = import_node_path5.default.join(options.dataDir, "cognition");
+    this.memories = new StructuredMemoryStore(import_node_path5.default.join(cognitionDir, "memories.v1.json"));
+    this.goals = new GoalManager(import_node_path5.default.join(cognitionDir, "goals.v1.json"));
+    this.skills = new SkillManager(import_node_path5.default.join(cognitionDir, "skills.v1.json"));
     this.attention = new AttentionEngine(this.config.attention.repetitionCooldownMs);
     this.initiative = new InitiativeEngine(this.config);
     this.mind = new AutonomousMind({
@@ -2568,9 +2688,9 @@ var CognitiveRuntime = class {
     this.sessionPersistTimer.unref?.();
   }
   async persistSession() {
-    const cognitionDir = import_node_path4.default.join(this.options.dataDir, "cognition");
+    const cognitionDir = import_node_path5.default.join(this.options.dataDir, "cognition");
     await import_promises5.default.mkdir(cognitionDir, { recursive: true });
-    const target = import_node_path4.default.join(cognitionDir, "last-session.json");
+    const target = import_node_path5.default.join(cognitionDir, "last-session.json");
     const temp = `${target}.${process.pid}.tmp`;
     const payload = {
       version: 1,
@@ -2614,7 +2734,7 @@ function stringArray(value) {
 }
 
 // cognition/safety.ts
-var import_node_crypto8 = require("node:crypto");
+var import_node_crypto9 = require("node:crypto");
 var SafetyPolicy = class {
   constructor(config) {
     this.config = config;
@@ -2657,7 +2777,7 @@ var ConfirmationStore = class {
     const created = Date.now();
     const confirmation = {
       ...input,
-      id: (0, import_node_crypto8.randomUUID)(),
+      id: (0, import_node_crypto9.randomUUID)(),
       createdAt: new Date(created).toISOString(),
       expiresAt: new Date(created + this.ttlMs).toISOString()
     };
@@ -2847,7 +2967,7 @@ function result(success, status, tool, value, error, riskLevel, started, attempt
 }
 
 // cognition/toolRegistry.ts
-var import_node_path5 = __toESM(require("node:path"), 1);
+var import_node_path6 = __toESM(require("node:path"), 1);
 var READ_ONLY = /* @__PURE__ */ new Set([
   "readFile",
   "listFiles",
@@ -2969,9 +3089,9 @@ function purposeFor(name) {
 function isImportantPath(value, projectRoot) {
   if (typeof value !== "string" || !projectRoot) return false;
   try {
-    const target = import_node_path5.default.resolve(value).toLowerCase();
-    const root = import_node_path5.default.resolve(projectRoot).toLowerCase();
-    return target === root || root.startsWith(target + import_node_path5.default.sep) || target.startsWith(root + import_node_path5.default.sep);
+    const target = import_node_path6.default.resolve(value).toLowerCase();
+    const root = import_node_path6.default.resolve(projectRoot).toLowerCase();
+    return target === root || root.startsWith(target + import_node_path6.default.sep) || target.startsWith(root + import_node_path6.default.sep);
   } catch {
     return false;
   }
@@ -3165,7 +3285,7 @@ var ScreenVisionPipeline = class {
 
 // api_hub/adapterRegistry.ts
 var import_promises6 = __toESM(require("node:fs/promises"), 1);
-var import_node_path6 = __toESM(require("node:path"), 1);
+var import_node_path7 = __toESM(require("node:path"), 1);
 
 // api_hub/healthChecker.ts
 var import_node_net = __toESM(require("node:net"), 1);
@@ -3236,7 +3356,7 @@ var ApiAdapterRegistry = class {
   loaded = false;
   async initialize() {
     if (this.loaded) return;
-    await import_promises6.default.mkdir(import_node_path6.default.dirname(this.filePath), { recursive: true });
+    await import_promises6.default.mkdir(import_node_path7.default.dirname(this.filePath), { recursive: true });
     try {
       const parsed = JSON.parse(await import_promises6.default.readFile(this.filePath, "utf-8"));
       if (parsed.version !== 1 || !Array.isArray(parsed.adapters)) throw new Error("Unsupported adapter registry format.");
@@ -3594,7 +3714,7 @@ function candidate(input) {
 }
 
 // api_hub/catalogueImporter.ts
-var import_node_crypto9 = require("node:crypto");
+var import_node_crypto10 = require("node:crypto");
 var PUBLIC_APIS_CATALOGUE_URL = "https://raw.githubusercontent.com/public-apis/public-apis/master/README.md";
 var TABLE_HEADER = /^\s*API\s*\|\s*Description\s*\|\s*Auth\s*\|\s*HTTPS\s*\|\s*CORS\s*\|?\s*$/i;
 var CATEGORY_HEADER = /^###\s+(.+?)\s*$/;
@@ -3722,12 +3842,12 @@ function normalizeUrl(value) {
   }
 }
 function providerId(documentationUrl) {
-  return `public-apis:${(0, import_node_crypto9.createHash)("sha256").update(documentationUrl.toLowerCase()).digest("hex").slice(0, 20)}`;
+  return `public-apis:${(0, import_node_crypto10.createHash)("sha256").update(documentationUrl.toLowerCase()).digest("hex").slice(0, 20)}`;
 }
 
 // api_hub/registry.ts
 var import_promises7 = __toESM(require("node:fs/promises"), 1);
-var import_node_path7 = __toESM(require("node:path"), 1);
+var import_node_path8 = __toESM(require("node:path"), 1);
 var EMPTY_HEALTH = {
   state: "unchecked",
   checkedAt: null,
@@ -3766,7 +3886,7 @@ var ApiCapabilityRegistry = class {
   writeQueue = Promise.resolve();
   async initialize() {
     if (this.loaded) return;
-    await import_promises7.default.mkdir(import_node_path7.default.dirname(this.filePath), { recursive: true });
+    await import_promises7.default.mkdir(import_node_path8.default.dirname(this.filePath), { recursive: true });
     try {
       const parsed = JSON.parse(await import_promises7.default.readFile(this.filePath, "utf-8"));
       if (parsed.version !== 1 || !Array.isArray(parsed.providers)) throw new Error("Unsupported API registry format.");
@@ -3955,15 +4075,15 @@ function counter(keys) {
 }
 
 // api_hub/service.ts
-var import_node_path8 = __toESM(require("node:path"), 1);
+var import_node_path9 = __toESM(require("node:path"), 1);
 var ApiHubService = class {
   constructor(options) {
     this.options = options;
     this.sourceUrl = options.sourceUrl || PUBLIC_APIS_CATALOGUE_URL;
     this.fetcher = options.fetcher || fetch;
-    const directory = import_node_path8.default.join(options.dataDir, "api-hub");
-    this.registry = new ApiCapabilityRegistry(import_node_path8.default.join(directory, "providers.v1.json"), this.sourceUrl);
-    this.adapters = new ApiAdapterRegistry(import_node_path8.default.join(directory, "adapters.v1.json"));
+    const directory = import_node_path9.default.join(options.dataDir, "api-hub");
+    this.registry = new ApiCapabilityRegistry(import_node_path9.default.join(directory, "providers.v1.json"), this.sourceUrl);
+    this.adapters = new ApiAdapterRegistry(import_node_path9.default.join(directory, "adapters.v1.json"));
   }
   registry;
   adapters;
@@ -4079,6 +4199,13 @@ function appendLog(fileName, message) {
 var logCommand = (m) => appendLog("commands.log", m);
 var logStartup = (m) => appendLog("startup.log", m);
 var logError = (m) => appendLog("errors.log", m);
+var cognitionEventPublisher = null;
+var errorProtocol = new ErrorProtocol({
+  dataDir: COGNITION_DATA_DIR,
+  publishEvent: (event) => cognitionEventPublisher?.(event),
+  onCritical: (record) => logError(`CRITICAL ${record.scope}: ${record.message}`)
+});
+errorProtocol.installProcessGuards();
 function sanitizeSpokenModelText(value) {
   return String(value || "").replace(/\[(?:AMAYRA\s+)?(?:INTERNAL\s+COGNITIVE|PROACTIVE\s+PRESENCE|VISUAL\s+AWARENESS)[^\]]*\]\s*/gi, "").replace(/^\s*(?:private\s+runtime\s+context|internal\s+amayra\s+event)\s*[:—-]\s*/i, "");
 }
@@ -4186,7 +4313,7 @@ function requiresImageCapture(tool, args) {
 }
 async function captureViaElectron(maxDim) {
   if (typeof process.send !== "function" || !process.connected) return null;
-  const id = (0, import_node_crypto10.randomUUID)();
+  const id = (0, import_node_crypto11.randomUUID)();
   return await new Promise((resolve) => {
     const timer = setTimeout(() => {
       pendingElectronCaptures.delete(id);
@@ -4312,6 +4439,67 @@ async function ensureDesktopAgent() {
     }
   }
   console.warn("[Desktop Agent] Did not come online within 20s. Desktop control will be unavailable.");
+}
+var agentWatchdogTimer = null;
+var agentReviveAttempts = 0;
+var agentLastReviveAt = 0;
+var agentCriticalReported = false;
+async function agentWatchdogTick() {
+  if (await isDesktopAgentAlive()) {
+    if (agentReviveAttempts > 0) {
+      errorProtocol.report({
+        severity: "transient",
+        scope: "desktopAgent.watchdog",
+        message: `Desktop agent back online after ${agentReviveAttempts} revival attempt(s).`
+      });
+    }
+    agentReviveAttempts = 0;
+    agentCriticalReported = false;
+    desktopAgentVerified = true;
+    return;
+  }
+  const now2 = Date.now();
+  if (now2 - agentLastReviveAt < 3e4) return;
+  agentLastReviveAt = now2;
+  agentReviveAttempts += 1;
+  desktopAgentVerified = false;
+  if (agentReviveAttempts > 5) {
+    if (!agentCriticalReported) {
+      agentCriticalReported = true;
+      errorProtocol.report({
+        severity: "critical",
+        scope: "desktopAgent.watchdog",
+        message: `Desktop agent remains down after ${agentReviveAttempts - 1} revival attempts; manual intervention required.`,
+        recoverable: false
+      });
+    }
+    return;
+  }
+  errorProtocol.report({
+    severity: "degraded",
+    scope: "desktopAgent.watchdog",
+    message: `Desktop agent unreachable; reviving (attempt ${agentReviveAttempts}).`
+  });
+  void ensureDesktopAgent().catch((error) => {
+    errorProtocol.report({
+      severity: "degraded",
+      scope: "desktopAgent.watchdog",
+      message: `Revival attempt failed: ${error instanceof Error ? error.message : String(error)}`
+    });
+  });
+}
+function startAgentWatchdog() {
+  if (agentWatchdogTimer) return;
+  agentWatchdogTimer = setInterval(() => {
+    void agentWatchdogTick();
+  }, 15e3);
+  agentWatchdogTimer.unref();
+}
+function stopAgentWatchdog() {
+  if (agentWatchdogTimer) {
+    clearInterval(agentWatchdogTimer);
+    agentWatchdogTimer = null;
+  }
 }
 async function fetchAgentToolCount() {
   try {
@@ -4679,13 +4867,24 @@ async function startServer() {
   const goalPlanner = new GoalPlanner(modelRouter, cognition.config.limits.maxPlanDepth * 2);
   const critic = new TaskCritic();
   const processCognitiveEvent = (event) => cognition.process(event).catch((error) => {
-    logError(`COGNITION_EVENT_FAILED ${event.type}: ${error instanceof Error ? error.message : String(error)}`);
+    const reason = error instanceof Error ? error.message : String(error);
+    logError(`COGNITION_EVENT_FAILED ${event.type}: ${reason}`);
+    if (!event.type.startsWith("system.core_error")) {
+      errorProtocol.report({ severity: "transient", scope: "cognition.event", message: `${event.type}: ${reason}` });
+    }
     return null;
   });
+  cognitionEventPublisher = (event) => {
+    void processCognitiveEvent(event);
+  };
   const desktopPerception = new DesktopPerception({
     fetchSnapshot: fetchDesktopObservation,
     emit: (event) => processCognitiveEvent(event).then(() => void 0),
     pollIntervalMs: 4e3
+  });
+  app.get("/api/core/errors", (req, res) => {
+    const limit = Math.max(1, Math.min(Number(req.query.limit) || 50, 200));
+    res.json({ ...errorProtocol.summary(), recent: errorProtocol.recent(limit) });
   });
   app.get("/api/cognition/status", (_req, res) => {
     res.json({
@@ -5421,7 +5620,7 @@ ${interceptorScript}`);
   });
   wss.on("connection", async (clientWs) => {
     console.log("Client WebSocket connected to /live");
-    const connectionId = (0, import_node_crypto10.randomUUID)();
+    const connectionId = (0, import_node_crypto11.randomUUID)();
     let screenVision = null;
     const rememberScreenVision = (pipeline) => {
       activeScreenVisionPipelines.set(connectionId, pipeline);
@@ -6474,7 +6673,7 @@ A fresh screenshot is attached. Analyze it and answer the spoken question direct
             nextPresenceAt = Math.max(lastIdlePresenceAt + 12e4, now2 + 2e4);
             return;
           }
-          const thoughtId = (0, import_node_crypto10.randomUUID)();
+          const thoughtId = (0, import_node_crypto11.randomUUID)();
           presenceTurnsWithoutUser += 1;
           if (mode === "idle_away") lastIdlePresenceAt = now2;
           nextPresenceAt = now2 + nextPresenceDelayMs(presenceTurnsWithoutUser);
@@ -6571,7 +6770,7 @@ A fresh screenshot is attached. Analyze it and answer the spoken question direct
                 confidence: 0.76,
                 metadata: {
                   connectionId,
-                  thoughtId: (0, import_node_crypto10.randomUUID)(),
+                  thoughtId: (0, import_node_crypto11.randomUUID)(),
                   thought: "The shared screen changed substantially. Inspect the latest frame and react only if there is a concrete new result, error, risk, surprise, or genuinely useful observation.",
                   topic: "latest shared screen",
                   suggestedAction: "SPEAK",
@@ -6706,9 +6905,15 @@ The one-shot screen capture was unavailable. Say clearly that you could not acce
     ensureDesktopAgent().then(async () => {
       await ensureDesktopObserver();
       if (cognition.config.desktopAwarenessEnabled && desktopObserverUrl) desktopPerception.start();
-    }).catch((e) => console.warn(`[Desktop Agent] Boot probe failed: ${e?.message || e}`));
+    }).catch((e) => {
+      const message = e instanceof Error ? e.message : String(e);
+      console.warn(`[Desktop Agent] Boot probe failed: ${message}`);
+      errorProtocol.report({ severity: "degraded", scope: "boot.desktopAgent", message });
+    });
+    startAgentWatchdog();
   });
   const shutdownCognition = () => {
+    stopAgentWatchdog();
     desktopPerception.stop();
     void cognition.shutdown().catch(
       (error) => logError(`COGNITION_SHUTDOWN_FAILED: ${error instanceof Error ? error.message : String(error)}`)
@@ -6804,7 +7009,7 @@ function createContextualThoughtCandidate(context) {
   const lastAmayra = (thread.lastAmayraStatement || "").trim();
   const timestamp = Date.now();
   const make = (origin, content, suggestedAction = "SPEAK", scores = {}) => ({
-    id: (0, import_node_crypto10.randomUUID)(),
+    id: (0, import_node_crypto11.randomUUID)(),
     createdAt: timestamp,
     origin,
     content,

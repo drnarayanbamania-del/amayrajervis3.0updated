@@ -42,6 +42,7 @@ import {
   type MemoryKind,
   type StructuredMemory,
   type ThoughtCandidate,
+  ErrorProtocol,
 } from "./cognition";
 import {
   ScreenVisionPipeline,
@@ -96,6 +97,19 @@ function appendLog(fileName: string, message: string): void {
 const logCommand = (m: string) => appendLog("commands.log", m);
 const logStartup = (m: string) => appendLog("startup.log", m);
 const logError = (m: string) => appendLog("errors.log", m);
+
+// ---------------------------------------------------------------------------
+// Core error protocol — single funnel for faults. Process guards are installed
+// at module load so even boot-time faults are captured; the cognitive event
+// bridge is plugged in once the runtime exists.
+// ---------------------------------------------------------------------------
+let cognitionEventPublisher: ((event: Parameters<CognitiveRuntime["process"]>[0]) => void) | null = null;
+const errorProtocol = new ErrorProtocol({
+  dataDir: COGNITION_DATA_DIR,
+  publishEvent: (event) => cognitionEventPublisher?.(event as Parameters<CognitiveRuntime["process"]>[0]),
+  onCritical: (record) => logError(`CRITICAL ${record.scope}: ${record.message}`),
+});
+errorProtocol.installProcessGuards();
 
 function sanitizeSpokenModelText(value: unknown): string {
   return String(value || "")
@@ -356,6 +370,74 @@ async function ensureDesktopAgent(): Promise<void> {
     }
   }
   console.warn("[Desktop Agent] Did not come online within 20s. Desktop control will be unavailable.");
+}
+
+// ---------------------------------------------------------------------------
+// Agent watchdog — the frozen agent can die (crash, OOM, user kill); the core
+// detects that within one tick and revives it, reporting through the error
+// protocol. At most one revival attempt per 30s; critical after 5 failures.
+// ---------------------------------------------------------------------------
+let agentWatchdogTimer: NodeJS.Timeout | null = null;
+let agentReviveAttempts = 0;
+let agentLastReviveAt = 0;
+let agentCriticalReported = false;
+
+async function agentWatchdogTick(): Promise<void> {
+  if (await isDesktopAgentAlive()) {
+    if (agentReviveAttempts > 0) {
+      errorProtocol.report({
+        severity: "transient",
+        scope: "desktopAgent.watchdog",
+        message: `Desktop agent back online after ${agentReviveAttempts} revival attempt(s).`,
+      });
+    }
+    agentReviveAttempts = 0;
+    agentCriticalReported = false;
+    desktopAgentVerified = true;
+    return;
+  }
+  const now = Date.now();
+  if (now - agentLastReviveAt < 30_000) return; // throttle revival attempts
+  agentLastReviveAt = now;
+  agentReviveAttempts += 1;
+  desktopAgentVerified = false;
+  if (agentReviveAttempts > 5) {
+    if (!agentCriticalReported) {
+      agentCriticalReported = true;
+      errorProtocol.report({
+        severity: "critical",
+        scope: "desktopAgent.watchdog",
+        message: `Desktop agent remains down after ${agentReviveAttempts - 1} revival attempts; manual intervention required.`,
+        recoverable: false,
+      });
+    }
+    return;
+  }
+  errorProtocol.report({
+    severity: "degraded",
+    scope: "desktopAgent.watchdog",
+    message: `Desktop agent unreachable; reviving (attempt ${agentReviveAttempts}).`,
+  });
+  void ensureDesktopAgent().catch((error) => {
+    errorProtocol.report({
+      severity: "degraded",
+      scope: "desktopAgent.watchdog",
+      message: `Revival attempt failed: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  });
+}
+
+function startAgentWatchdog(): void {
+  if (agentWatchdogTimer) return;
+  agentWatchdogTimer = setInterval(() => { void agentWatchdogTick(); }, 15_000);
+  agentWatchdogTimer.unref();
+}
+
+function stopAgentWatchdog(): void {
+  if (agentWatchdogTimer) {
+    clearInterval(agentWatchdogTimer);
+    agentWatchdogTimer = null;
+  }
 }
 
 /** Query the running desktop agent for its registered tool count. */
@@ -768,14 +850,24 @@ async function startServer() {
 
   const processCognitiveEvent = (event: Parameters<CognitiveRuntime["process"]>[0]) =>
     cognition.process(event).catch((error) => {
-      logError(`COGNITION_EVENT_FAILED ${event.type}: ${error instanceof Error ? error.message : String(error)}`);
+      const reason = error instanceof Error ? error.message : String(error);
+      logError(`COGNITION_EVENT_FAILED ${event.type}: ${reason}`);
+      if (!event.type.startsWith("system.core_error")) {
+        errorProtocol.report({ severity: "transient", scope: "cognition.event", message: `${event.type}: ${reason}` });
+      }
       return null;
     });
+  cognitionEventPublisher = (event) => { void processCognitiveEvent(event); };
 
   const desktopPerception = new DesktopPerception({
     fetchSnapshot: fetchDesktopObservation,
     emit: (event) => processCognitiveEvent(event).then(() => undefined),
     pollIntervalMs: 4_000,
+  });
+
+  app.get("/api/core/errors", (req, res) => {
+    const limit = Math.max(1, Math.min(Number(req.query.limit) || 50, 200));
+    res.json({ ...errorProtocol.summary(), recent: errorProtocol.recent(limit) });
   });
 
   app.get("/api/cognition/status", (_req, res) => {
@@ -3121,10 +3213,16 @@ async function startServer() {
         await ensureDesktopObserver();
         if (cognition.config.desktopAwarenessEnabled && desktopObserverUrl) desktopPerception.start();
       })
-      .catch((e) => console.warn(`[Desktop Agent] Boot probe failed: ${e?.message || e}`));
+      .catch((e) => {
+        const message = e instanceof Error ? e.message : String(e);
+        console.warn(`[Desktop Agent] Boot probe failed: ${message}`);
+        errorProtocol.report({ severity: "degraded", scope: "boot.desktopAgent", message });
+      });
+    startAgentWatchdog();
   });
 
   const shutdownCognition = () => {
+    stopAgentWatchdog();
     desktopPerception.stop();
     void cognition.shutdown().catch((error) =>
       logError(`COGNITION_SHUTDOWN_FAILED: ${error instanceof Error ? error.message : String(error)}`),

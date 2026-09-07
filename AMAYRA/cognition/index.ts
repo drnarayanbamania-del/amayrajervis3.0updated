@@ -17,6 +17,13 @@ export {
   type DesktopDownloadSnapshot,
 } from "./desktopPerception";
 export { CognitiveEventBus } from "./eventBus";
+export {
+  ErrorProtocol,
+  type CoreErrorInput,
+  type CoreErrorRecord,
+  type CoreErrorSeverity,
+  type ErrorProtocolOptions,
+} from "./errorProtocol";
 export { GoalManager, type CreateGoalInput } from "./goalManager";
 export { InitiativeEngine } from "./initiativeEngine";
 export {
