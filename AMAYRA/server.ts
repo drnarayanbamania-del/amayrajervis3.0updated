@@ -105,10 +105,15 @@ const logError = (m: string) => appendLog("errors.log", m);
 // bridge is plugged in once the runtime exists.
 // ---------------------------------------------------------------------------
 let cognitionEventPublisher: ((event: Parameters<CognitiveRuntime["process"]>[0]) => void) | null = null;
+/** Set once the Telegram bridge exists; critical core faults also ping the owner's phone. */
+let telegramCriticalNotifier: ((message: string) => void) | null = null;
 const errorProtocol = new ErrorProtocol({
   dataDir: COGNITION_DATA_DIR,
   publishEvent: (event) => cognitionEventPublisher?.(event as Parameters<CognitiveRuntime["process"]>[0]),
-  onCritical: (record) => logError(`CRITICAL ${record.scope}: ${record.message}`),
+  onCritical: (record) => {
+    logError(`CRITICAL ${record.scope}: ${record.message}`);
+    telegramCriticalNotifier?.(`🚨 AMAYRA core fault (${record.scope}): ${record.message}`);
+  },
 });
 errorProtocol.installProcessGuards();
 
@@ -899,6 +904,61 @@ async function startServer() {
       return `Core state: ${situation.state} · desktop agent: ${agentInfo}`;
     },
   });
+
+  // Critical core faults ping the owner's phone directly, bypassing throttle.
+  telegramCriticalNotifier = (message) => { void telegramBridge.notifyOwner(message, { force: true }); };
+
+  // ---------------------------------------------------------------------------
+  // Proactive Telegram alerts — a GLOBAL decision listener. The per-connection
+  // initiative handler speaks through the app only while it is open; this one
+  // reaches the owner's phone even when the app is closed. Importance floor +
+  // a model-judged "worth interrupting the phone?" gate (SKIP escape) keep it
+  // from becoming spam; throttle + force bypass live in the bridge.
+  // ---------------------------------------------------------------------------
+  let lastTelegramAlertAttemptAt = 0;
+  cognition.onDecision((outcome) => {
+    try {
+      if (!outcome.decision.shouldGenerateSpeech) return;
+      const type = outcome.event.type;
+      if (type.startsWith("conversation.")) return; // chat turns are answered in-channel
+      if (type === "internal.proactive_presence") return; // idle check-ins stay in-app
+      const isCritical = outcome.decision.action === "WARN";
+      const score = Number(outcome.attention?.score ?? 0);
+      if (!isCritical && score < 0.7) return;
+      const now = Date.now();
+      if (!isCritical && now - lastTelegramAlertAttemptAt < 120_000) return;
+      lastTelegramAlertAttemptAt = now;
+      const apiKey = getGeminiApiKey();
+      if (!apiKey) return;
+      const meta = outcome.event.metadata ?? {};
+      const observation = [
+        typeof meta.thought === "string" ? meta.thought : "",
+        typeof meta.topic === "string" ? `topic: ${meta.topic}` : "",
+        typeof meta.activeWindow === "string" ? `window: ${meta.activeWindow}` : "",
+        typeof meta.message === "string" ? meta.message : "",
+      ].filter(Boolean).join(" | ") || type;
+      const client = new GoogleGenAI({ apiKey });
+      const prompt = [
+        "You are AMAYRA, a witty AI companion running on the user's Windows PC. The user is away from the app; this reaches their Telegram chat on their phone.",
+        `Private observation: ${observation}`,
+        "Decide whether this is genuinely worth interrupting their phone: visible errors, finished results (build/download/render), risks, or an important desktop change. Routine activity and vague observations are NOT worth it.",
+        "If it is not worth it, return exactly: SKIP",
+        "Otherwise write ONE short natural line (at most two short sentences) in the user's style (Hinglish or English), no prefix, no quotes, no mention of monitoring or internal context.",
+      ].join("\n");
+      void client.models.generateContent({ model: "gemini-3.5-flash", contents: prompt })
+        .then((response) => {
+          const text = (response.text ?? "").trim();
+          if (!text || /^SKIP$/i.test(text)) return;
+          return telegramBridge.notifyOwner(`🔔 ${text}`);
+        })
+        .catch((error) => {
+          logError(`TELEGRAM_ALERT_MODEL_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+        });
+    } catch (error) {
+      logError(`TELEGRAM_ALERT_LISTENER_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+
 
   const desktopPerception = new DesktopPerception({
     fetchSnapshot: fetchDesktopObservation,

@@ -4342,6 +4342,15 @@ function sleep(ms, signal2) {
     );
   });
 }
+function friendlyModelError(error) {
+  const raw = error instanceof Error ? error.message : String(error);
+  if (/RESOURCE_EXHAUSTED|exceeded your current quota|\b429\b/i.test(raw)) {
+    return new Error(
+      "Gemini ka aaj ka free quota (20 requests) khatam ho gaya \u{1F605} Quota midnight PT pe reset hota hai \u2014 ya phir Google AI Studio me billing enable karke limit bada sakte ho."
+    );
+  }
+  return error instanceof Error ? error : new Error(raw);
+}
 function chunkText(text) {
   if (text.length <= REPLY_CHUNK) return [text];
   const chunks = [];
@@ -4363,6 +4372,7 @@ var TelegramBridge = class {
   config = {};
   history = /* @__PURE__ */ new Map();
   lastMessageAt = /* @__PURE__ */ new Map();
+  lastProactiveAt = 0;
   offset = 0;
   stopController = null;
   startedAt = Date.now();
@@ -4415,6 +4425,25 @@ var TelegramBridge = class {
     this.stop();
     this.start();
   }
+  /**
+   * Proactively message the owner (paired chat only). Throttled to one
+   * message per 2 minutes unless force=true (critical faults). Returns
+   * false when the bridge is offline, unpaired, throttled, or the send failed.
+   */
+  async notifyOwner(text, options) {
+    if (!this.stopController || !this.config.botToken || this.config.pairedChatId === void 0) return false;
+    const now2 = Date.now();
+    if (options?.force !== true && now2 - this.lastProactiveAt < 12e4) return false;
+    this.lastProactiveAt = now2;
+    try {
+      await this.reply(this.config.pairedChatId, text);
+      this.options.logCommand(`TELEGRAM_NOTIFY chat=${this.config.pairedChatId} len=${text.length}`);
+      return true;
+    } catch (error) {
+      this.options.reportError("transient", "telegram.notify", error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
   clearPairing() {
     delete this.config.pairedChatId;
     delete this.config.pairedName;
@@ -4432,6 +4461,12 @@ var TelegramBridge = class {
     this.startedAt = Date.now();
     this.stopController = new AbortController();
     void this.pollLoop(this.stopController.signal);
+    if (this.config.pairedChatId !== void 0) {
+      void this.notifyOwner(
+        "\u{1F514} Proactive alerts armed \u2014 ab main khud message karungi jab desktop par kuch important hoga.",
+        { force: true }
+      );
+    }
   }
   stop() {
     this.stopController?.abort();
@@ -4607,6 +4642,20 @@ var TelegramBridge = class {
     }
     return list;
   }
+  async generateTurn(client, contents) {
+    try {
+      return await client.models.generateContent({
+        model: TEXT_MODEL,
+        contents,
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION,
+          tools: [{ functionDeclarations: TELEGRAM_TOOLS }]
+        }
+      });
+    } catch (error) {
+      throw friendlyModelError(error);
+    }
+  }
   async handleConversation(msg, text) {
     const apiKey = this.options.getApiKey();
     if (!apiKey) {
@@ -4630,14 +4679,7 @@ var TelegramBridge = class {
     let finalText = "";
     let pendingScreenshot = null;
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round += 1) {
-      const response = await client.models.generateContent({
-        model: TEXT_MODEL,
-        contents,
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          tools: [{ functionDeclarations: TELEGRAM_TOOLS }]
-        }
-      });
+      const response = await this.generateTurn(client, contents);
       const calls = response.functionCalls ?? [];
       if (!calls.length) {
         finalText = response.text ?? "";
@@ -4776,10 +4818,14 @@ var logCommand = (m) => appendLog("commands.log", m);
 var logStartup = (m) => appendLog("startup.log", m);
 var logError = (m) => appendLog("errors.log", m);
 var cognitionEventPublisher = null;
+var telegramCriticalNotifier = null;
 var errorProtocol = new ErrorProtocol({
   dataDir: COGNITION_DATA_DIR,
   publishEvent: (event) => cognitionEventPublisher?.(event),
-  onCritical: (record) => logError(`CRITICAL ${record.scope}: ${record.message}`)
+  onCritical: (record) => {
+    logError(`CRITICAL ${record.scope}: ${record.message}`);
+    telegramCriticalNotifier?.(`\u{1F6A8} AMAYRA core fault (${record.scope}): ${record.message}`);
+  }
 });
 errorProtocol.installProcessGuards();
 function sanitizeSpokenModelText(value) {
@@ -5488,6 +5534,50 @@ async function startServer() {
       const situation = cognition.situation.getSnapshot();
       const agentInfo = agentAlive ? `online (${await fetchAgentToolCount()} tools)` : "offline";
       return `Core state: ${situation.state} \xB7 desktop agent: ${agentInfo}`;
+    }
+  });
+  telegramCriticalNotifier = (message) => {
+    void telegramBridge.notifyOwner(message, { force: true });
+  };
+  let lastTelegramAlertAttemptAt = 0;
+  cognition.onDecision((outcome) => {
+    try {
+      if (!outcome.decision.shouldGenerateSpeech) return;
+      const type = outcome.event.type;
+      if (type.startsWith("conversation.")) return;
+      if (type === "internal.proactive_presence") return;
+      const isCritical = outcome.decision.action === "WARN";
+      const score = Number(outcome.attention?.score ?? 0);
+      if (!isCritical && score < 0.7) return;
+      const now2 = Date.now();
+      if (!isCritical && now2 - lastTelegramAlertAttemptAt < 12e4) return;
+      lastTelegramAlertAttemptAt = now2;
+      const apiKey = getGeminiApiKey();
+      if (!apiKey) return;
+      const meta = outcome.event.metadata ?? {};
+      const observation = [
+        typeof meta.thought === "string" ? meta.thought : "",
+        typeof meta.topic === "string" ? `topic: ${meta.topic}` : "",
+        typeof meta.activeWindow === "string" ? `window: ${meta.activeWindow}` : "",
+        typeof meta.message === "string" ? meta.message : ""
+      ].filter(Boolean).join(" | ") || type;
+      const client = new import_genai3.GoogleGenAI({ apiKey });
+      const prompt = [
+        "You are AMAYRA, a witty AI companion running on the user's Windows PC. The user is away from the app; this reaches their Telegram chat on their phone.",
+        `Private observation: ${observation}`,
+        "Decide whether this is genuinely worth interrupting their phone: visible errors, finished results (build/download/render), risks, or an important desktop change. Routine activity and vague observations are NOT worth it.",
+        "If it is not worth it, return exactly: SKIP",
+        "Otherwise write ONE short natural line (at most two short sentences) in the user's style (Hinglish or English), no prefix, no quotes, no mention of monitoring or internal context."
+      ].join("\n");
+      void client.models.generateContent({ model: "gemini-3.5-flash", contents: prompt }).then((response) => {
+        const text = (response.text ?? "").trim();
+        if (!text || /^SKIP$/i.test(text)) return;
+        return telegramBridge.notifyOwner(`\u{1F514} ${text}`);
+      }).catch((error) => {
+        logError(`TELEGRAM_ALERT_MODEL_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    } catch (error) {
+      logError(`TELEGRAM_ALERT_LISTENER_FAILED: ${error instanceof Error ? error.message : String(error)}`);
     }
   });
   const desktopPerception = new DesktopPerception({

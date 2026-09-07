@@ -256,6 +256,17 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/** Map raw Gemini API failures (which can be a whole JSON blob) to a friendly, human reply. */
+function friendlyModelError(error: unknown): Error {
+  const raw = error instanceof Error ? error.message : String(error);
+  if (/RESOURCE_EXHAUSTED|exceeded your current quota|\b429\b/i.test(raw)) {
+    return new Error(
+      "Gemini ka aaj ka free quota (20 requests) khatam ho gaya 😅 Quota midnight PT pe reset hota hai — ya phir Google AI Studio me billing enable karke limit bada sakte ho.",
+    );
+  }
+  return error instanceof Error ? error : new Error(raw);
+}
+
 function chunkText(text: string): string[] {
   if (text.length <= REPLY_CHUNK) return [text];
   const chunks: string[] = [];
@@ -274,6 +285,7 @@ export class TelegramBridge {
   private config: TelegramConfig = {};
   private readonly history = new Map<number, Array<{ role: "user" | "model"; text: string }>>();
   private readonly lastMessageAt = new Map<number, number>();
+  private lastProactiveAt = 0;
   private offset = 0;
   private stopController: AbortController | null = null;
   private startedAt = Date.now();
@@ -345,6 +357,26 @@ export class TelegramBridge {
     this.start();
   }
 
+  /**
+   * Proactively message the owner (paired chat only). Throttled to one
+   * message per 2 minutes unless force=true (critical faults). Returns
+   * false when the bridge is offline, unpaired, throttled, or the send failed.
+   */
+  async notifyOwner(text: string, options?: { force?: boolean }): Promise<boolean> {
+    if (!this.stopController || !this.config.botToken || this.config.pairedChatId === undefined) return false;
+    const now = Date.now();
+    if (options?.force !== true && now - this.lastProactiveAt < 120_000) return false;
+    this.lastProactiveAt = now;
+    try {
+      await this.reply(this.config.pairedChatId, text);
+      this.options.logCommand(`TELEGRAM_NOTIFY chat=${this.config.pairedChatId} len=${text.length}`);
+      return true;
+    } catch (error) {
+      this.options.reportError("transient", "telegram.notify", error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
   clearPairing(): void {
     delete this.config.pairedChatId;
     delete this.config.pairedName;
@@ -364,6 +396,14 @@ export class TelegramBridge {
     this.startedAt = Date.now();
     this.stopController = new AbortController();
     void this.pollLoop(this.stopController.signal);
+    // Confirm the alert channel end-to-end on every polling start (boot or
+    // token save). Only possible once stopController exists — paired only.
+    if (this.config.pairedChatId !== undefined) {
+      void this.notifyOwner(
+        "🔔 Proactive alerts armed — ab main khud message karungi jab desktop par kuch important hoga.",
+        { force: true },
+      );
+    }
   }
 
   stop(): void {
@@ -548,6 +588,24 @@ export class TelegramBridge {
     return list;
   }
 
+  private async generateTurn(
+    client: GoogleGenAI,
+    contents: Content[],
+  ): Promise<Awaited<ReturnType<GoogleGenAI["models"]["generateContent"]>>> {
+    try {
+      return await client.models.generateContent({
+        model: TEXT_MODEL,
+        contents,
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION,
+          tools: [{ functionDeclarations: TELEGRAM_TOOLS }],
+        },
+      });
+    } catch (error) {
+      throw friendlyModelError(error);
+    }
+  }
+
   private async handleConversation(msg: TelegramMessage, text: string): Promise<void> {
     const apiKey = this.options.getApiKey();
     if (!apiKey) {
@@ -574,14 +632,7 @@ export class TelegramBridge {
     let pendingScreenshot: string | null = null;
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round += 1) {
-      const response = await client.models.generateContent({
-        model: TEXT_MODEL,
-        contents,
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          tools: [{ functionDeclarations: TELEGRAM_TOOLS }],
-        },
-      });
+      const response = await this.generateTurn(client, contents);
       const calls = response.functionCalls ?? [];
       if (!calls.length) {
         finalText = response.text ?? "";
