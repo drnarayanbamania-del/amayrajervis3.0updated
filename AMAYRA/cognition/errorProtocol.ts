@@ -155,7 +155,28 @@ export class ErrorProtocol {
     if (this.installed) return;
     this.installed = true;
 
+    // Broken-pipe immunity: losing the console (parent closed the pipe, app
+    // quitting, WMI relaunch) must never kill the backend — the HTTP service
+    // is independent of stdout/stderr. Without this, an EPIPE on a console
+    // write surfaces as an uncaughtException and the fail-fast guard below
+    // would take the whole backend down.
+    for (const stream of [process.stdout, process.stderr]) {
+      stream?.on?.("error", (error: NodeJS.ErrnoException) => {
+        if (error.code === "EPIPE") return; // nobody is listening; keep serving
+        throw error;
+      });
+    }
+
     process.on("uncaughtException", (error: Error) => {
+      if ((error as NodeJS.ErrnoException).code === "EPIPE") {
+        this.report({
+          severity: "transient",
+          scope: "process.epipe",
+          message: "Broken pipe on a console stream ignored; backend keeps running.",
+          recoverable: true,
+        });
+        return;
+      }
       this.report({
         severity: "critical",
         scope: "process.uncaughtException",
