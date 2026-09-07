@@ -1,7 +1,5 @@
 node_modules/
-dist/
 release/
-agent_dist/
 .env
 *.log
 .amayra-data/
