@@ -2774,6 +2774,11 @@ async function startServer() {
             const details = String((event as any)?.error?.message || (event as any)?.message || "Unknown Gemini Live error");
             console.error("Gemini Live session error:", details);
             logError(`GEMINI_LIVE_ERROR: ${details}`);
+            errorProtocol.report({
+              severity: "degraded",
+              scope: "geminiLive.session",
+              message: `Live session error: ${details}`,
+            });
             try {
               clientWs.send(JSON.stringify({ type: "error", error: `Gemini Live error: ${details}` }));
             } catch {
@@ -2785,8 +2790,22 @@ async function startServer() {
             const details = `code=${event.code} reason=${reason}`;
             const authenticationRejected =
               event.code === 1008 && /authentication|credential|api.?key|unauthenticated/i.test(reason);
-            console.error("Gemini Live session closed:", details);
-            logError(`GEMINI_LIVE_CLOSED ${details}`);
+            // Google sends 1008+GoAway when a Live session reaches its maximum
+            // duration; that and 1000/1001 are expected lifecycle, not faults.
+            const sessionDurationLimit =
+              event.code === 1008 && /goaway|session.?duration|duration.?limit/i.test(reason);
+            const expectedClosure = event.code === 1000 || event.code === 1001 || sessionDurationLimit;
+            if (expectedClosure) {
+              console.log(`Gemini Live session closed (expected): ${details}`);
+            } else {
+              console.error("Gemini Live session closed:", details);
+              logError(`GEMINI_LIVE_CLOSED ${details}`);
+              errorProtocol.report({
+                severity: "degraded",
+                scope: "geminiLive.session",
+                message: `Live session closed unexpectedly: ${details}`,
+              });
+            }
             if (authenticationRejected) {
               // Remove an unusable stored key and suppress an invalid .env fallback.
               // The client reloads so ApiKeyGate can securely request a replacement.
@@ -2798,6 +2817,18 @@ async function startServer() {
                     type: "error",
                     code: "INVALID_API_KEY",
                     error: "Google rejected the saved Gemini API key. Enter a new key to continue.",
+                  }
+                : sessionDurationLimit
+                ? {
+                    type: "error",
+                    code: "SESSION_DURATION_LIMIT",
+                    error: "Voice session reached Google's maximum duration. Start a new session to continue.",
+                  }
+                : expectedClosure
+                ? {
+                    type: "error",
+                    code: "SESSION_CLOSED",
+                    error: "Voice session ended.",
                   }
                 : {
                     type: "error",

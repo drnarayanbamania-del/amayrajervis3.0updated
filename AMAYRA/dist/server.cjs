@@ -6533,6 +6533,11 @@ A fresh screenshot is attached. Analyze it and answer the spoken question direct
             const details = String(event?.error?.message || event?.message || "Unknown Gemini Live error");
             console.error("Gemini Live session error:", details);
             logError(`GEMINI_LIVE_ERROR: ${details}`);
+            errorProtocol.report({
+              severity: "degraded",
+              scope: "geminiLive.session",
+              message: `Live session error: ${details}`
+            });
             try {
               clientWs.send(JSON.stringify({ type: "error", error: `Gemini Live error: ${details}` }));
             } catch {
@@ -6542,8 +6547,19 @@ A fresh screenshot is attached. Analyze it and answer the spoken question direct
             const reason = event.reason || "No close reason provided";
             const details = `code=${event.code} reason=${reason}`;
             const authenticationRejected = event.code === 1008 && /authentication|credential|api.?key|unauthenticated/i.test(reason);
-            console.error("Gemini Live session closed:", details);
-            logError(`GEMINI_LIVE_CLOSED ${details}`);
+            const sessionDurationLimit = event.code === 1008 && /goaway|session.?duration|duration.?limit/i.test(reason);
+            const expectedClosure = event.code === 1e3 || event.code === 1001 || sessionDurationLimit;
+            if (expectedClosure) {
+              console.log(`Gemini Live session closed (expected): ${details}`);
+            } else {
+              console.error("Gemini Live session closed:", details);
+              logError(`GEMINI_LIVE_CLOSED ${details}`);
+              errorProtocol.report({
+                severity: "degraded",
+                scope: "geminiLive.session",
+                message: `Live session closed unexpectedly: ${details}`
+              });
+            }
             if (authenticationRejected) {
               clearGeminiApiKey();
             }
@@ -6552,6 +6568,14 @@ A fresh screenshot is attached. Analyze it and answer the spoken question direct
                 type: "error",
                 code: "INVALID_API_KEY",
                 error: "Google rejected the saved Gemini API key. Enter a new key to continue."
+              } : sessionDurationLimit ? {
+                type: "error",
+                code: "SESSION_DURATION_LIMIT",
+                error: "Voice session reached Google's maximum duration. Start a new session to continue."
+              } : expectedClosure ? {
+                type: "error",
+                code: "SESSION_CLOSED",
+                error: "Voice session ended."
               } : {
                 type: "error",
                 error: `Gemini Live closed (${details}). Open Settings \u2192 Voice to verify or replace the API key.`
