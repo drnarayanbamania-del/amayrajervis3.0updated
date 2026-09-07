@@ -63,3 +63,11 @@ then loads `http://localhost:3000`.
 - Packaging requires `build/AMAYRA-launcher.exe` (compiled from
   `electron/launcher.cs`); `afterPack.cjs` swaps the Electron stub exe for the
   launcher and keeps the real runtime as `AMAYRA-runtime.exe`.
+- Build the installer with `npm run dist:repack` (electron-builder over the
+  prebuilt `dist/`). Plain `npm run dist` fails here because its
+  `build:renderer` step needs the missing renderer source (root `index.html`).
+- `@google/genai` MUST stay in `dependencies`. It briefly lived in
+  `devDependencies`, so 1.0.2 installers shipped without it and the backend
+  crashed on boot with `Cannot find module '@google/genai'` (the infamous
+  "AMAYRA backend stopped (code 1)" dialog). Version 1.0.3 fixes this and
+  persists backend stderr to `<userData>\logs\backend-stderr.log`.

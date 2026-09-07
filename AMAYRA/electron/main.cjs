@@ -111,8 +111,23 @@ function startBackend() {
     windowsHide: true,
   });
 
+  // Capture backend stderr: piped to the (invisible) launcher console today,
+  // so a crash used to leave no evidence. Persist it and keep a tail for the
+  // error dialog.
+  const backendErrLog = path.join(dataDir, 'logs', 'backend-stderr.log');
+  const stderrTail = [];
+  try {
+    fs.mkdirSync(path.join(dataDir, 'logs'), { recursive: true });
+    fs.writeFileSync(backendErrLog, '');
+  } catch { /* best-effort */ }
+
   serverProcess.stdout?.on('data', (d) => process.stdout.write(`[server] ${d}`));
-  serverProcess.stderr?.on('data', (d) => process.stderr.write(`[server] ${d}`));
+  serverProcess.stderr?.on('data', (d) => {
+    process.stderr.write(`[server] ${d}`);
+    stderrTail.push(String(d));
+    if (stderrTail.length > 40) stderrTail.shift();
+    try { fs.appendFile(backendErrLog, String(d), () => {}); } catch { /* best-effort */ }
+  });
   serverProcess.on('message', (message) => {
     if (!message || message.type !== 'screen-capture-request' || !message.id) return;
     void (async () => {
@@ -136,9 +151,12 @@ function startBackend() {
   });
   serverProcess.on('exit', (code, signal) => {
     if (!isQuitting) {
+      const recent = stderrTail.join('').trim().split('\n').slice(-12).join('\n');
       dialog.showErrorBox(
         'AMAYRA backend stopped',
-        `The AMAYRA backend process exited unexpectedly (code ${code}, signal ${signal}).`,
+        `The AMAYRA backend process exited unexpectedly (code ${code}, signal ${signal}).`
+          + (recent ? `\n\nRecent backend output:\n${recent}` : '')
+          + `\n\nFull backend log: ${backendErrLog}`,
       );
       app.quit();
     }

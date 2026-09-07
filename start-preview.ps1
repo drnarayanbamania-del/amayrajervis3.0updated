@@ -11,6 +11,9 @@ $log       = 'C:\Users\drnar\Documents\Default Project\sakeera-jarvis\.freebuff\
 $env:NODE_ENV = 'production'
 $env:AMAYRA_DATA_DIR = $dataDir
 $env:AMAYRA_COGNITION_DATA_DIR = $dataDir
+# LAN binding: lets the MAYA phone app (same WiFi) reach POST /chat.
+# Remove or set to 127.0.0.1 to go local-only again.
+$env:AMAYRA_HOST = '0.0.0.0'
 
 $proc = Start-Process -FilePath 'node.exe' `
   -ArgumentList 'dist\server.cjs' `
