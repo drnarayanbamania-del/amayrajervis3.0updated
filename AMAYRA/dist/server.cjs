@@ -5939,6 +5939,42 @@ async function startServer() {
       res.status(500).json({ error: e?.message || "Failed to save API key." });
     }
   });
+  app.post("/chat", async (req, res) => {
+    const prompt = (req.body?.prompt ?? "").toString().trim();
+    if (!prompt) return res.status(400).json({ error: "prompt is required." });
+    const apiKey = getGeminiApiKey();
+    if (!apiKey) return res.status(503).json({ error: "No Gemini API key configured on the host." });
+    try {
+      const recalled = await cognition.memories.retrieve({
+        text: prompt,
+        projectId: cognition.situation.getSnapshot().currentProject,
+        limit: 4,
+        minConfidence: 0.3
+      }).catch(() => []);
+      const memoryCard = recalled.length ? "\nRelevant memories: " + recalled.map((m) => m.content.slice(0, 100)).join(" | ") : "";
+      const client = new import_genai3.GoogleGenAI({ apiKey });
+      const result2 = await client.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: "You are AMAYRA, the user's warm, witty AI companion on their PC, replying to their phone. Match the user's language (Hinglish/Hindi/English). Keep it chat-short (1-4 sentences)." + memoryCard + "\nUser: " + prompt
+      });
+      const response = (result2.text ?? "").trim();
+      if (!response) return res.status(502).json({ error: "Model returned an empty response." });
+      logCommand(`PHONE_CHAT len=${prompt.length} reply=${response.length}`);
+      if (String(req.headers.accept || "").includes("text/event-stream")) {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.write(`data: ${JSON.stringify({ delta: { content: response } })}
+
+`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      } else {
+        res.json({ response });
+      }
+    } catch (e) {
+      logError(`PHONE_CHAT_FAILED: ${e?.message || e}`);
+      res.status(500).json({ error: "AMAYRA could not answer right now." });
+    }
+  });
   app.get("/api/telegram/status", (_req, res) => {
     res.json(telegramBridge.status());
   });
@@ -7661,9 +7697,10 @@ The one-shot screen capture was unavailable. Say clearly that you could not acce
       res.sendFile(import_path2.default.join(distPath, "index.html"));
     });
   }
-  server.listen(PORT, "127.0.0.1", () => {
-    logStartup(`AMAYRA V2 server started on http://localhost:${PORT}`);
-    console.log(`[Server] Running on http://localhost:${PORT}`);
+  const bindHost = process.env.AMAYRA_HOST || "127.0.0.1";
+  server.listen(PORT, bindHost, () => {
+    logStartup(`AMAYRA V2 server started on http://${bindHost}:${PORT}`);
+    console.log(`[Server] Running on http://${bindHost === "0.0.0.0" ? "localhost" : bindHost}:${PORT}`);
     ensureDesktopAgent().then(async () => {
       await ensureDesktopObserver();
       if (cognition.config.desktopAwarenessEnabled && desktopObserverUrl) desktopPerception.start();

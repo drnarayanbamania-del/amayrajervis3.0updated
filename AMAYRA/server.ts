@@ -1369,6 +1369,52 @@ async function startServer() {
   });
 
   // ---------------------------------------------------------------------------
+  // Phone-companion contract (SAKEERA AI v2.11 / MAYA Agentic v3.0):
+  // POST /chat {prompt, conversationId} -> {response} | text/event-stream.
+  // Lets the MAYA phone app use AMAYRA's brain over the LAN.
+  // ---------------------------------------------------------------------------
+  app.post("/chat", async (req, res) => {
+    const prompt = (req.body?.prompt ?? "").toString().trim();
+    if (!prompt) return res.status(400).json({ error: "prompt is required." });
+    const apiKey = getGeminiApiKey();
+    if (!apiKey) return res.status(503).json({ error: "No Gemini API key configured on the host." });
+    try {
+      const recalled = await cognition.memories.retrieve({
+        text: prompt,
+        projectId: cognition.situation.getSnapshot().currentProject,
+        limit: 4,
+        minConfidence: 0.3,
+      }).catch(() => [] as Array<{ content: string }>);
+      const memoryCard = recalled.length
+        ? "\nRelevant memories: " + recalled.map((m) => m.content.slice(0, 100)).join(" | ")
+        : "";
+      const client = new GoogleGenAI({ apiKey });
+      const result = await client.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents:
+          "You are AMAYRA, the user's warm, witty AI companion on their PC, replying to their phone. " +
+          "Match the user's language (Hinglish/Hindi/English). Keep it chat-short (1-4 sentences)." +
+          memoryCard +
+          "\nUser: " + prompt,
+      });
+      const response = (result.text ?? "").trim();
+      if (!response) return res.status(502).json({ error: "Model returned an empty response." });
+      logCommand(`PHONE_CHAT len=${prompt.length} reply=${response.length}`);
+      if (String(req.headers.accept || "").includes("text/event-stream")) {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.write(`data: ${JSON.stringify({ delta: { content: response } })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      } else {
+        res.json({ response });
+      }
+    } catch (e: any) {
+      logError(`PHONE_CHAT_FAILED: ${e?.message || e}`);
+      res.status(500).json({ error: "AMAYRA could not answer right now." });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
   // Telegram bridge administration. The bot token never returns to clients.
   // ---------------------------------------------------------------------------
   app.get("/api/telegram/status", (_req, res) => {
@@ -3378,9 +3424,12 @@ async function startServer() {
     });
   }
 
-  server.listen(PORT, "127.0.0.1", () => {
-    logStartup(`AMAYRA V2 server started on http://localhost:${PORT}`);
-    console.log(`[Server] Running on http://localhost:${PORT}`);
+  // Bind host: 127.0.0.1 by default (local-only). Set AMAYRA_HOST=0.0.0.0 to
+  // let devices on the same LAN (the MAYA phone app) reach the server.
+  const bindHost = process.env.AMAYRA_HOST || "127.0.0.1";
+  server.listen(PORT, bindHost, () => {
+    logStartup(`AMAYRA V2 server started on http://${bindHost}:${PORT}`);
+    console.log(`[Server] Running on http://${bindHost === "0.0.0.0" ? "localhost" : bindHost}:${PORT}`);
     // Kick off the desktop agent (probe + auto-spawn) immediately on boot.
     ensureDesktopAgent()
       .then(async () => {
