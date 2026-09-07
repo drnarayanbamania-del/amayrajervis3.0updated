@@ -2454,6 +2454,26 @@ async function startServer() {
         },
         callbacks: {
           onmessage: (message: LiveServerMessage) => {
+            // Graceful GoAway handling: Google signals the session is ending
+            // (max session duration reached) and expects the client to close
+            // promptly. If we fail to close, Google aborts the connection with
+            // close code 1008 ("failed to close after GoAway"). Close our side
+            // cleanly and tell the client the session duration was exhausted.
+            if (message.goAway) {
+              const timeLeft = (message.goAway as { timeLeft?: string | null })?.timeLeft ?? "unknown";
+              console.log(`[Gemini Live] GoAway received (timeLeft=${timeLeft}) — closing session gracefully.`);
+              try {
+                clientWs.send(JSON.stringify({
+                  type: "error",
+                  code: "SESSION_DURATION_LIMIT",
+                  error: "Voice session reached Google's maximum duration. Start a new session to continue.",
+                }));
+              } catch { /* client already gone */ }
+              try {
+                session.close();
+              } catch { /* session already closing */ }
+              return;
+            }
             // Audio Stream Chunk (model response audio play, 24kHz raw PCM)
             const audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
             if (audio) {

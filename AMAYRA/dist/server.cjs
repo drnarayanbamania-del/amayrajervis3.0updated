@@ -6259,6 +6259,23 @@ ${presenceInstructions}`,
         },
         callbacks: {
           onmessage: (message) => {
+            if (message.goAway) {
+              const timeLeft = message.goAway?.timeLeft ?? "unknown";
+              console.log(`[Gemini Live] GoAway received (timeLeft=${timeLeft}) \u2014 closing session gracefully.`);
+              try {
+                clientWs.send(JSON.stringify({
+                  type: "error",
+                  code: "SESSION_DURATION_LIMIT",
+                  error: "Voice session reached Google's maximum duration. Start a new session to continue."
+                }));
+              } catch {
+              }
+              try {
+                session.close();
+              } catch {
+              }
+              return;
+            }
             const audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
             if (audio) {
               if (!amayraSpeechObserved) {
