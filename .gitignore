@@ -1,0 +1,26 @@
+# Dependencies (restore with: cd AMAYRA && npm install)
+node_modules/
+
+# Local app data - contains secrets.json (Gemini API key) and live memories
+.amayra-data/
+
+# Environment files with real credentials
+.env
+.env.local
+.env.*.local
+
+# Build/installer output
+release/
+*.exe.bak
+
+# Logs
+*.log
+logs/
+
+# Archives
+*.zip
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
