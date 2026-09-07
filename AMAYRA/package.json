@@ -1,10 +1,10 @@
 {
   "name": "amayra",
   "productName": "AMAYRA",
-  "description": "AMAYRA — a private 3D AI desktop companion powered by each user's own Gemini API key.",
+  "description": "AMAYRA \u00e2\u20ac\u201d a private 3D AI desktop companion powered by each user's own Gemini API key.",
   "author": "AMAYRA",
   "private": true,
-  "version": "1.0.2",
+  "version": "1.0.3",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -16,9 +16,11 @@
     "dev": "npm run build:server && electron .",
     "start": "npm run build:server && electron .",
     "dist": "npm run build:server && npm run build:renderer && electron-builder --win nsis",
+    "dist:repack": "npm run build:server && electron-builder --win nsis",
     "dist:dir": "npm run build:server && electron-builder --win nsis --dir"
   },
   "dependencies": {
+    "@google/genai": "2.4.0",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
     "dotenv": "17.2.3",
@@ -33,7 +35,6 @@
     "ws": "^8.21.0"
   },
   "devDependencies": {
-    "@google/genai": "2.4.0",
     "@types/express": "^4.17.25",
     "@types/node": "^22.20.1",
     "@types/react": "^19.2.18",
@@ -93,7 +94,7 @@
       "perMachine": true,
       "allowToChangeInstallationDirectory": true,
       "artifactName": "AMAYRA-Setup-${version}.${ext}",
-      "uninstallerName": "Uninstall AMAYRA"
+      "uninstallDisplayName": "Uninstall AMAYRA"
     }
   }
 }
