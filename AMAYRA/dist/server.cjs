@@ -7697,7 +7697,7 @@ The one-shot screen capture was unavailable. Say clearly that you could not acce
       res.sendFile(import_path2.default.join(distPath, "index.html"));
     });
   }
-  const bindHost = process.env.AMAYRA_HOST || "127.0.0.1";
+  const bindHost = process.env.AMAYRA_HOST || "0.0.0.0";
   server.listen(PORT, bindHost, () => {
     logStartup(`AMAYRA V2 server started on http://${bindHost}:${PORT}`);
     console.log(`[Server] Running on http://${bindHost === "0.0.0.0" ? "localhost" : bindHost}:${PORT}`);

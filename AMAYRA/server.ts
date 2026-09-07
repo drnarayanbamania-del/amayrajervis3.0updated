@@ -3424,9 +3424,9 @@ async function startServer() {
     });
   }
 
-  // Bind host: 127.0.0.1 by default (local-only). Set AMAYRA_HOST=0.0.0.0 to
-  // let devices on the same LAN (the MAYA phone app) reach the server.
-  const bindHost = process.env.AMAYRA_HOST || "127.0.0.1";
+  // Bind host: 0.0.0.0 by default so LAN devices (the MAYA phone app) can use
+  // this PC as their brain. Set AMAYRA_HOST=127.0.0.1 to go local-only again.
+  const bindHost = process.env.AMAYRA_HOST || "0.0.0.0";
   server.listen(PORT, bindHost, () => {
     logStartup(`AMAYRA V2 server started on http://${bindHost}:${PORT}`);
     console.log(`[Server] Running on http://${bindHost === "0.0.0.0" ? "localhost" : bindHost}:${PORT}`);
