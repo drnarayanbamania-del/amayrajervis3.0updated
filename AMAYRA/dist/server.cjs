@@ -26,9 +26,9 @@ var import_express = __toESM(require("express"), 1);
 var import_http = __toESM(require("http"), 1);
 var import_path2 = __toESM(require("path"), 1);
 var import_ws = require("ws");
-var import_genai2 = require("@google/genai");
+var import_genai3 = require("@google/genai");
 var import_dotenv = __toESM(require("dotenv"), 1);
-var fs9 = __toESM(require("fs"), 1);
+var fs10 = __toESM(require("fs"), 1);
 var import_node_crypto11 = require("node:crypto");
 var import_promises8 = __toESM(require("node:dns/promises"), 1);
 var import_node_net2 = __toESM(require("node:net"), 1);
@@ -4163,6 +4163,582 @@ function clamp12(value, min, max) {
   return Math.max(min, Math.min(max, Math.floor(value)));
 }
 
+// server_telegram.ts
+var import_genai2 = require("@google/genai");
+var import_fs2 = __toESM(require("fs"), 1);
+var TG_API = "https://api.telegram.org";
+var TEXT_MODEL = "gemini-3.5-flash";
+var MAX_TOOL_ROUNDS = 4;
+var HISTORY_LIMIT = 10;
+var MIN_MESSAGE_INTERVAL_MS = 700;
+var REPLY_CHUNK = 3800;
+var LONG_POLL_SECONDS = 25;
+var REQUEST_TIMEOUT_MS = 4e4;
+var TELEGRAM_TOOLS = [
+  {
+    name: "openApplication",
+    description: "Open an installed Windows application by name.",
+    parameters: { type: import_genai2.Type.OBJECT, properties: { name: { type: import_genai2.Type.STRING } }, required: ["name"] }
+  },
+  {
+    name: "closeApplication",
+    description: "Close a running application by name. Set force only when the user asks to force-close.",
+    parameters: {
+      type: import_genai2.Type.OBJECT,
+      properties: { name: { type: import_genai2.Type.STRING }, force: { type: import_genai2.Type.BOOLEAN } },
+      required: ["name"]
+    }
+  },
+  {
+    name: "openWebsite",
+    description: "Open a website (name shortcut like 'youtube' or a full URL) in the default browser.",
+    parameters: {
+      type: import_genai2.Type.OBJECT,
+      properties: { name: { type: import_genai2.Type.STRING }, url: { type: import_genai2.Type.STRING } }
+    }
+  },
+  {
+    name: "searchWeb",
+    description: "Search the web (google, youtube, github, duckduckgo, bing) and open the results page.",
+    parameters: {
+      type: import_genai2.Type.OBJECT,
+      properties: { query: { type: import_genai2.Type.STRING }, engine: { type: import_genai2.Type.STRING } },
+      required: ["query"]
+    }
+  },
+  {
+    name: "searchYouTube",
+    description: "Search YouTube and open the results page.",
+    parameters: { type: import_genai2.Type.OBJECT, properties: { query: { type: import_genai2.Type.STRING } }, required: ["query"] }
+  },
+  { name: "volumeUp", description: "Raise system volume one step.", parameters: { type: import_genai2.Type.OBJECT, properties: {} } },
+  { name: "volumeDown", description: "Lower system volume one step.", parameters: { type: import_genai2.Type.OBJECT, properties: {} } },
+  { name: "muteToggle", description: "Toggle system mute.", parameters: { type: import_genai2.Type.OBJECT, properties: {} } },
+  {
+    name: "setVolume",
+    description: "Set system volume to a percentage (0-100).",
+    parameters: { type: import_genai2.Type.OBJECT, properties: { percent: { type: import_genai2.Type.NUMBER } }, required: ["percent"] }
+  },
+  {
+    name: "typeText",
+    description: "Type literal text into the currently focused window/control.",
+    parameters: {
+      type: import_genai2.Type.OBJECT,
+      properties: { text: { type: import_genai2.Type.STRING } },
+      required: ["text"]
+    }
+  },
+  {
+    name: "pressKey",
+    description: "Press a keyboard key (e.g. enter, tab, esc) a number of times.",
+    parameters: {
+      type: import_genai2.Type.OBJECT,
+      properties: { key: { type: import_genai2.Type.STRING }, presses: { type: import_genai2.Type.INTEGER } },
+      required: ["key"]
+    }
+  },
+  {
+    name: "hotkey",
+    description: "Press a key combination of 2-5 keys, e.g. ['ctrl','shift','esc'].",
+    parameters: {
+      type: import_genai2.Type.OBJECT,
+      properties: { keys: { type: import_genai2.Type.ARRAY, items: { type: import_genai2.Type.STRING } } },
+      required: ["keys"]
+    }
+  },
+  {
+    name: "click",
+    description: "Click at optional screen coordinates (x, y) or at the current cursor position.",
+    parameters: {
+      type: import_genai2.Type.OBJECT,
+      properties: { x: { type: import_genai2.Type.INTEGER }, y: { type: import_genai2.Type.INTEGER }, button: { type: import_genai2.Type.STRING } }
+    }
+  },
+  {
+    name: "scroll",
+    description: "Scroll at the cursor: positive amount scrolls up, negative scrolls down.",
+    parameters: {
+      type: import_genai2.Type.OBJECT,
+      properties: { amount: { type: import_genai2.Type.INTEGER } },
+      required: ["amount"]
+    }
+  },
+  {
+    name: "getActiveWindow",
+    description: "Get the title of the currently focused window.",
+    parameters: { type: import_genai2.Type.OBJECT, properties: {} }
+  },
+  {
+    name: "listVisibleWindows",
+    description: "List all currently visible window titles.",
+    parameters: { type: import_genai2.Type.OBJECT, properties: {} }
+  },
+  {
+    name: "systemInfo",
+    description: "Get system information (CPU, RAM, OS).",
+    parameters: { type: import_genai2.Type.OBJECT, properties: {} }
+  },
+  {
+    name: "takeScreenshot",
+    description: "Capture the screen; the photo is sent back to the user on Telegram.",
+    parameters: { type: import_genai2.Type.OBJECT, properties: {} }
+  },
+  {
+    name: "saveCustomMemory",
+    description: "Persist an important fact about the user to AMAYRA's long-term memory.",
+    parameters: {
+      type: import_genai2.Type.OBJECT,
+      properties: {
+        category: {
+          type: import_genai2.Type.STRING,
+          enum: ["identity", "preference", "goal", "project", "relationship", "emotional", "behavior"]
+        },
+        text: { type: import_genai2.Type.STRING }
+      },
+      required: ["category", "text"]
+    }
+  },
+  {
+    name: "requestPowerAction",
+    description: "FIRST STEP for power actions (shutdown, restart, sleep, lock). Returns a confirmation token; ask the user to confirm with /confirm <id>.",
+    parameters: {
+      type: import_genai2.Type.OBJECT,
+      properties: { action: { type: import_genai2.Type.STRING, enum: ["shutdown", "restart", "sleep", "lock"] } },
+      required: ["action"]
+    }
+  },
+  {
+    name: "executePowerAction",
+    description: "Execute a power action using the token returned by requestPowerAction, after explicit user confirmation.",
+    parameters: {
+      type: import_genai2.Type.OBJECT,
+      properties: { token: { type: import_genai2.Type.STRING } },
+      required: ["token"]
+    }
+  }
+];
+var SYSTEM_INSTRUCTION = `You are AMAYRA, a warm, witty AI companion running on your owner's Windows PC. You are talking over Telegram text messages.
+
+Style: short, chat-style replies (1-4 sentences unless detail is clearly needed). Mirror the user's language \u2014 Hinglish, Hindi, or English. Occasional light emoji are fine.
+
+Abilities: you control the owner's PC through tools \u2014 open/close applications and websites, search the web, control volume, type text, press keys, click, scroll, take screenshots (the photo is delivered automatically), read system info, and save important facts to long-term memory.
+
+Rules:
+- NEVER reveal secrets, API keys, tokens, or credential-like file contents.
+- For shutdown/restart/sleep/lock: call requestPowerAction first, then executePowerAction only after the user explicitly confirms. If a tool returns confirmation_required, tell the user to send /confirm <id> in this chat.
+- If a tool fails, briefly say what happened. Do not pretend an action succeeded.
+- You cannot see the screen unless you call takeScreenshot.`;
+function sleep(ms, signal2) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+    signal2?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true }
+    );
+  });
+}
+function chunkText(text) {
+  if (text.length <= REPLY_CHUNK) return [text];
+  const chunks = [];
+  let rest = text;
+  while (rest.length > REPLY_CHUNK) {
+    let cut = rest.lastIndexOf("\n", REPLY_CHUNK);
+    if (cut < REPLY_CHUNK / 2) cut = REPLY_CHUNK;
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  if (rest.trim()) chunks.push(rest);
+  return chunks;
+}
+var TelegramBridge = class {
+  constructor(options) {
+    this.options = options;
+    this.config = this.readConfig();
+  }
+  config = {};
+  history = /* @__PURE__ */ new Map();
+  lastMessageAt = /* @__PURE__ */ new Map();
+  offset = 0;
+  stopController = null;
+  startedAt = Date.now();
+  // ---------------------------------------------------------------- config
+  readConfig() {
+    try {
+      if (import_fs2.default.existsSync(this.options.configPath)) {
+        return JSON.parse(import_fs2.default.readFileSync(this.options.configPath, "utf-8"));
+      }
+    } catch {
+    }
+    return {};
+  }
+  saveConfig() {
+    try {
+      import_fs2.default.writeFileSync(this.options.configPath, JSON.stringify(this.config, null, 2), "utf-8");
+    } catch (error) {
+      this.options.logError(`TELEGRAM_CONFIG_SAVE_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  status() {
+    return {
+      configured: Boolean(this.config.botToken),
+      running: this.stopController !== null,
+      botUsername: this.config.botUsername ?? null,
+      pairedChatId: this.config.pairedChatId ?? null,
+      pairedName: this.config.pairedName ?? null,
+      pairedAt: this.config.pairedAt ?? null,
+      uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1e3)
+    };
+  }
+  /** Validate + persist the bot token, then (re)start polling. */
+  async setToken(token) {
+    const trimmed = token.trim();
+    if (!trimmed) throw new Error("Bot token is required.");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5e3);
+    timer.unref?.();
+    try {
+      const res = await fetch(`${TG_API}/bot${trimmed}/getMe`, { signal: controller.signal });
+      if (!res.ok) throw new Error("Telegram rejected this token (check it via @BotFather /token).");
+      const data = await res.json();
+      this.config.botToken = trimmed;
+      this.config.botUsername = data.result?.username ?? void 0;
+      this.saveConfig();
+      this.options.logCommand(`TELEGRAM_TOKEN_SAVED bot=@${this.config.botUsername ?? "unknown"}`);
+    } finally {
+      clearTimeout(timer);
+    }
+    this.stop();
+    this.start();
+  }
+  clearPairing() {
+    delete this.config.pairedChatId;
+    delete this.config.pairedName;
+    delete this.config.pairedAt;
+    this.saveConfig();
+    this.options.logCommand("TELEGRAM_UNPAIRED");
+  }
+  // ---------------------------------------------------------------- polling
+  start() {
+    if (this.stopController) return;
+    if (!this.config.botToken) {
+      this.options.logStartup("TELEGRAM_DISABLED no bot token configured (POST /api/telegram/config to enable)");
+      return;
+    }
+    this.startedAt = Date.now();
+    this.stopController = new AbortController();
+    void this.pollLoop(this.stopController.signal);
+  }
+  stop() {
+    this.stopController?.abort();
+    this.stopController = null;
+  }
+  async pollLoop(signal2) {
+    const token = this.config.botToken;
+    this.options.logStartup(`TELEGRAM_POLLING_STARTED bot=@${this.config.botUsername ?? "unknown"}`);
+    let consecutiveErrors = 0;
+    while (!signal2.aborted) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      timer.unref?.();
+      const abortFromStop = () => controller.abort();
+      signal2.addEventListener("abort", abortFromStop, { once: true });
+      try {
+        const res = await fetch(
+          `${TG_API}/bot${token}/getUpdates?timeout=${LONG_POLL_SECONDS}&offset=${this.offset}`,
+          { signal: controller.signal }
+        );
+        if (!res.ok) {
+          consecutiveErrors += 1;
+          const body = await res.text().catch(() => "");
+          if (res.status === 401) {
+            this.options.reportError("degraded", "telegram.auth", "Telegram rejected the bot token (401). Replace it via POST /api/telegram/config.");
+            await sleep(3e4, signal2);
+          } else if (res.status === 409) {
+            this.options.reportError("degraded", "telegram.conflict", "Another poller (a second AMAYRA instance?) is using this bot token (409).");
+            await sleep(3e4, signal2);
+          } else {
+            this.options.reportError("transient", "telegram.poll", `getUpdates HTTP ${res.status}: ${body.slice(0, 160)}`);
+            await sleep(5e3, signal2);
+          }
+          continue;
+        }
+        consecutiveErrors = 0;
+        const data = await res.json();
+        for (const update of data.result ?? []) {
+          this.offset = Math.max(this.offset, update.update_id + 1);
+          void this.handleUpdate(update).catch((error) => {
+            this.options.reportError("degraded", "telegram.update", error instanceof Error ? error.message : String(error));
+          });
+        }
+      } catch (error) {
+        if (signal2.aborted) return;
+        consecutiveErrors += 1;
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/abort/i.test(message)) {
+          this.options.reportError("transient", "telegram.poll", `Network error: ${message}`);
+        }
+        await sleep(Math.min(5e3 * consecutiveErrors, 3e4), signal2);
+      } finally {
+        clearTimeout(timer);
+        signal2.removeEventListener("abort", abortFromStop);
+      }
+    }
+  }
+  // ---------------------------------------------------------------- updates
+  async handleUpdate(update) {
+    const msg = update.message;
+    const text = msg?.text?.trim();
+    if (!msg || !text) return;
+    if (this.config.pairedChatId === void 0) {
+      this.config.pairedChatId = msg.chat.id;
+      this.config.pairedName = msg.from?.first_name ?? msg.chat.first_name ?? msg.chat.username ?? void 0;
+      this.config.pairedAt = (/* @__PURE__ */ new Date()).toISOString();
+      this.saveConfig();
+      this.options.logCommand(`TELEGRAM_PAIRED chat=${msg.chat.id} name=${this.config.pairedName ?? "unknown"}`);
+      await this.reply(
+        msg.chat.id,
+        "\u{1F510} Paired! This Telegram is now AMAYRA's remote control.\n\nSend me anything \u2014 I'll reply, and I can control the PC: apps, websites, volume, typing, clicks, screenshots.\n\n" + this.helpText()
+      );
+      return;
+    }
+    if (msg.chat.id !== this.config.pairedChatId) {
+      this.options.logCommand(`TELEGRAM_IGNORED_UNPAIRED chat=${msg.chat.id}`);
+      return;
+    }
+    const now2 = Date.now();
+    const last = this.lastMessageAt.get(msg.chat.id) ?? 0;
+    if (now2 - last < MIN_MESSAGE_INTERVAL_MS) return;
+    this.lastMessageAt.set(msg.chat.id, now2);
+    this.options.logCommand(`TELEGRAM_MESSAGE chat=${msg.chat.id} len=${text.length}`);
+    this.options.publishEvent({
+      type: "conversation.telegram_message",
+      source: "conversation",
+      importance: 0.6,
+      correlationId: `telegram-${msg.chat.id}`,
+      metadata: { origin: "telegram", chatId: msg.chat.id, text }
+    });
+    try {
+      if (text.startsWith("/")) await this.handleCommand(msg, text);
+      else await this.handleConversation(msg, text);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.options.reportError("degraded", "telegram.handle", message);
+      await this.reply(msg.chat.id, `\u26A0\uFE0F ${message}`).catch(() => void 0);
+    }
+  }
+  // ---------------------------------------------------------------- commands
+  helpText() {
+    return [
+      "\u{1F4DC} Commands:",
+      "/status \u2014 core + agent health",
+      "/screenshot \u2014 grab the PC screen",
+      "/confirm <id> \u2014 approve a pending risky action",
+      "/forget \u2014 unpair this chat",
+      "",
+      "Or just talk: \u201Cnotepad kholo\u201D, \u201Cvolume 40%\u201D, \u201CYouTube pe lofi chalao\u201D, \u201Cwhat's my PC doing?\u201D"
+    ].join("\n");
+  }
+  async handleCommand(msg, text) {
+    const [command, ...rest] = text.split(/\s+/);
+    const chatId = msg.chat.id;
+    switch (command.toLowerCase()) {
+      case "/start":
+        await this.reply(chatId, "\u{1F44B} AMAYRA online. " + this.helpText());
+        return;
+      case "/help":
+        await this.reply(chatId, this.helpText());
+        return;
+      case "/status": {
+        const lines = [
+          `\u{1F916} @${this.config.botUsername ?? "bot"} \xB7 polling ${this.stopController ? "live" : "stopped"}`,
+          `\u{1F517} paired: ${this.config.pairedName ?? "unknown"} (${this.config.pairedChatId})`
+        ];
+        if (this.options.collectStatus) {
+          try {
+            lines.push(await this.options.collectStatus());
+          } catch {
+          }
+        }
+        await this.reply(chatId, lines.join("\n"));
+        return;
+      }
+      case "/confirm": {
+        const id = rest[0];
+        if (!id) {
+          await this.reply(chatId, "Usage: /confirm <id>");
+          return;
+        }
+        const outcome = await this.options.confirmTool(id);
+        const result2 = outcome;
+        const body = result2?.success ? `\u2705 Executed (${result2.status ?? "ok"}).` : `\u274C Not executed (${result2?.status ?? "failed"}${result2?.error ? `: ${result2.error}` : ""}).`;
+        await this.reply(chatId, body);
+        return;
+      }
+      case "/screenshot": {
+        const outcome = await this.options.executeTool("takeScreenshot", { include_image: true, max_dim: 1280 });
+        const image = this.extractImage(outcome.result);
+        if (outcome.success && image) {
+          await this.sendPhoto(chatId, image, "\u{1F5A5}\uFE0F Current screen");
+        } else {
+          await this.reply(chatId, `\u26A0\uFE0F Screenshot failed: ${outcome.error ?? "no image returned"}`);
+        }
+        return;
+      }
+      case "/forget":
+        this.clearPairing();
+        await this.reply(chatId, "\u{1F513} Unpaired. The next chat to message this bot becomes its owner.");
+        return;
+      default:
+        await this.reply(chatId, `Unknown command ${command}. ${this.helpText()}`);
+        return;
+    }
+  }
+  // ---------------------------------------------------------------- conversation
+  historyFor(chatId) {
+    let list = this.history.get(chatId);
+    if (!list) {
+      list = [];
+      this.history.set(chatId, list);
+    }
+    return list;
+  }
+  async handleConversation(msg, text) {
+    const apiKey = this.options.getApiKey();
+    if (!apiKey) {
+      await this.reply(msg.chat.id, "\u26A0\uFE0F No Gemini API key is configured on the core, so I can't think right now.");
+      return;
+    }
+    const client = new import_genai2.GoogleGenAI({ apiKey });
+    let memoryCard = "";
+    try {
+      const recalled = await this.options.retrieveMemories(text);
+      if (recalled.length) {
+        memoryCard = "\n\nRelevant memories:\n" + recalled.map((m) => `- ${m.text ?? ""}`.trimEnd()).join("\n");
+      }
+    } catch {
+    }
+    const history = this.historyFor(msg.chat.id);
+    const contents = [
+      ...history.map((entry) => ({ role: entry.role, parts: [{ text: entry.text }] })),
+      { role: "user", parts: [{ text: text + memoryCard }] }
+    ];
+    let finalText = "";
+    let pendingScreenshot = null;
+    for (let round = 0; round <= MAX_TOOL_ROUNDS; round += 1) {
+      const response = await client.models.generateContent({
+        model: TEXT_MODEL,
+        contents,
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION,
+          tools: [{ functionDeclarations: TELEGRAM_TOOLS }]
+        }
+      });
+      const calls = response.functionCalls ?? [];
+      if (!calls.length) {
+        finalText = response.text ?? "";
+        break;
+      }
+      contents.push({
+        role: "model",
+        parts: calls.map((call) => ({ functionCall: { name: call.name ?? "", args: call.args ?? {} } }))
+      });
+      const responseParts = [];
+      for (const call of calls) {
+        const name = call.name ?? "";
+        const args = { ...call.args ?? {} };
+        let outcome;
+        if (name === "takeScreenshot") {
+          args.include_image = true;
+          args.max_dim = 1280;
+          outcome = await this.options.executeTool(name, args);
+          pendingScreenshot = this.extractImage(outcome.result) ?? pendingScreenshot;
+        } else {
+          outcome = await this.options.executeTool(name, args);
+        }
+        this.options.logCommand(`TELEGRAM_TOOL ${name} status=${outcome.status}`);
+        responseParts.push({
+          functionResponse: {
+            name,
+            response: {
+              ok: outcome.success,
+              status: outcome.status,
+              output: summarizeResult(outcome.result),
+              error: outcome.error ?? null,
+              confirmation_id: outcome.confirmationId ?? null
+            }
+          }
+        });
+      }
+      contents.push({ role: "user", parts: responseParts });
+      if (round === MAX_TOOL_ROUNDS) finalText = response.text ?? "I hit my tool-use limit for this message.";
+    }
+    if (pendingScreenshot) {
+      await this.sendPhoto(msg.chat.id, pendingScreenshot).catch(() => void 0);
+    }
+    finalText = (finalText || "Done.").trim();
+    await this.reply(msg.chat.id, finalText);
+    history.push({ role: "user", text });
+    history.push({ role: "model", text: finalText });
+    while (history.length > HISTORY_LIMIT) history.shift();
+  }
+  // ---------------------------------------------------------------- replies
+  async apiCall(method, body) {
+    const token = this.config.botToken;
+    if (!token) throw new Error("Bot token is not configured.");
+    const res = await fetch(`${TG_API}/bot${token}/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`Telegram ${method} failed (${res.status}): ${detail.slice(0, 160)}`);
+    }
+  }
+  async reply(chatId, text) {
+    for (const chunk of chunkText(text)) {
+      await this.apiCall("sendMessage", { chat_id: chatId, text: chunk });
+    }
+  }
+  async sendPhoto(chatId, imageBase64, caption) {
+    const token = this.config.botToken;
+    if (!token) throw new Error("Bot token is not configured.");
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    if (caption) form.append("caption", caption);
+    const bytes = Buffer.from(imageBase64, "base64");
+    form.append("photo", new Blob([bytes], { type: "image/jpeg" }), "amayra-screenshot.jpg");
+    const res = await fetch(`${TG_API}/bot${token}/sendPhoto`, { method: "POST", body: form });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`Telegram sendPhoto failed (${res.status}): ${detail.slice(0, 160)}`);
+    }
+  }
+  extractImage(result2) {
+    if (!result2 || typeof result2 !== "object") return null;
+    const payload = result2;
+    const image = payload.image_base64 ?? payload.imageBase64 ?? payload.base64;
+    return typeof image === "string" && image.length > 64 ? image : null;
+  }
+};
+function summarizeResult(result2) {
+  if (result2 === null || result2 === void 0) return null;
+  if (typeof result2 !== "object") return result2;
+  const payload = result2;
+  const slim = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (typeof value === "string" && value.length > 400) slim[key] = value.slice(0, 400) + "\u2026";
+    else if (key === "image_base64" || key === "imageBase64") slim[key] = "<image delivered via sendPhoto>";
+    else slim[key] = value;
+  }
+  return slim;
+}
+
 // server.ts
 import_dotenv.default.config();
 var COGNITION_DATA_DIR = process.env.AMAYRA_COGNITION_DATA_DIR || (process.env.AMAYRA_DATA_DIR ? DATA_DIR : import_path2.default.join(DATA_DIR, ".amayra-data"));
@@ -4170,12 +4746,12 @@ async function migrateDevelopmentCognitionData() {
   if (import_path2.default.resolve(COGNITION_DATA_DIR) === import_path2.default.resolve(DATA_DIR)) return;
   const sourceDir = import_path2.default.join(DATA_DIR, "cognition");
   const targetDir = import_path2.default.join(COGNITION_DATA_DIR, "cognition");
-  await fs9.promises.mkdir(targetDir, { recursive: true });
+  await fs10.promises.mkdir(targetDir, { recursive: true });
   for (const name of ["memories.v1.json", "goals.v1.json", "skills.v1.json", "last-session.json"]) {
     const source = import_path2.default.join(sourceDir, name);
     const target = import_path2.default.join(targetDir, name);
     try {
-      await fs9.promises.copyFile(source, target, fs9.constants.COPYFILE_EXCL);
+      await fs10.promises.copyFile(source, target, fs10.constants.COPYFILE_EXCL);
     } catch (error) {
       const code = error.code;
       if (code !== "ENOENT" && code !== "EEXIST") throw error;
@@ -4184,14 +4760,14 @@ async function migrateDevelopmentCognitionData() {
 }
 var LOGS_DIR = import_path2.default.join(DATA_DIR, "logs");
 try {
-  fs9.mkdirSync(LOGS_DIR, { recursive: true });
+  fs10.mkdirSync(LOGS_DIR, { recursive: true });
 } catch {
 }
 function appendLog(fileName, message) {
   try {
     const line = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${message}
 `;
-    fs9.appendFile(import_path2.default.join(LOGS_DIR, fileName), line, () => {
+    fs10.appendFile(import_path2.default.join(LOGS_DIR, fileName), line, () => {
     });
   } catch {
   }
@@ -4368,7 +4944,7 @@ function spawnDesktopAgent() {
     frozenCandidates.push(import_path2.default.join(process.cwd(), "agent_dist", "amayra-agent", "amayra-agent.exe"));
   }
   const frozenExe = frozenCandidates.find(
-    (candidate2) => Boolean(candidate2 && fs9.existsSync(candidate2))
+    (candidate2) => Boolean(candidate2 && fs10.existsSync(candidate2))
   );
   if (frozenExe) {
     try {
@@ -4853,7 +5429,7 @@ async function startServer() {
         if (signal2?.aborted) throw new Error("Model call cancelled.");
         const key = getGeminiApiKey();
         if (!key) throw new Error("No Gemini API key is configured.");
-        const modelClient = new import_genai2.GoogleGenAI({ apiKey: key });
+        const modelClient = new import_genai3.GoogleGenAI({ apiKey: key });
         const response = await modelClient.models.generateContent({ model, contents: prompt });
         if (signal2?.aborted) throw new Error("Model call cancelled.");
         return response.text || "";
@@ -4877,6 +5453,43 @@ async function startServer() {
   cognitionEventPublisher = (event) => {
     void processCognitiveEvent(event);
   };
+  const telegramBridge = new TelegramBridge({
+    configPath: dataFile("telegram.json"),
+    getApiKey: () => getGeminiApiKey(),
+    retrieveMemories: async (text) => {
+      const recalled = await cognition.memories.retrieve({
+        text,
+        projectId: cognition.situation.getSnapshot().currentProject,
+        limit: 5,
+        minConfidence: 0.3
+      });
+      return recalled.map((memory) => ({ text: memory.content }));
+    },
+    executeTool: async (tool, args) => {
+      const outcome = await toolExecutor.execute(tool, args, { correlationId: `telegram-${(0, import_node_crypto11.randomUUID)()}` });
+      return {
+        success: outcome.success,
+        status: outcome.status,
+        result: outcome.result,
+        error: outcome.error,
+        confirmationId: outcome.confirmationId
+      };
+    },
+    confirmTool: (confirmationId) => toolExecutor.confirm(confirmationId),
+    publishEvent: (event) => {
+      void processCognitiveEvent(event);
+    },
+    reportError: (severity, scope, message) => errorProtocol.report({ severity, scope, message }),
+    logCommand,
+    logStartup,
+    logError,
+    collectStatus: async () => {
+      const agentAlive = await isDesktopAgentAlive();
+      const situation = cognition.situation.getSnapshot();
+      const agentInfo = agentAlive ? `online (${await fetchAgentToolCount()} tools)` : "offline";
+      return `Core state: ${situation.state} \xB7 desktop agent: ${agentInfo}`;
+    }
+  });
   const desktopPerception = new DesktopPerception({
     fetchSnapshot: fetchDesktopObservation,
     emit: (event) => processCognitiveEvent(event).then(() => void 0),
@@ -5167,15 +5780,15 @@ async function startServer() {
   const SETTINGS_FILE = dataFile("settings.json");
   function loadSettingsFile() {
     try {
-      if (fs9.existsSync(SETTINGS_FILE)) {
-        return JSON.parse(fs9.readFileSync(SETTINGS_FILE, "utf-8"));
+      if (fs10.existsSync(SETTINGS_FILE)) {
+        return JSON.parse(fs10.readFileSync(SETTINGS_FILE, "utf-8"));
       }
     } catch {
     }
     return {};
   }
   function saveSettingsFile(data) {
-    fs9.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2), "utf-8");
+    fs10.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2), "utf-8");
   }
   app.get("/api/settings", async (_req, res) => {
     try {
@@ -5214,7 +5827,7 @@ async function startServer() {
         return res.status(400).json({ error: "API key is required." });
       }
       try {
-        const test = new import_genai2.GoogleGenAI({ apiKey: key });
+        const test = new import_genai3.GoogleGenAI({ apiKey: key });
         const pager = await test.models.list();
         await pager[Symbol.asyncIterator]().next();
       } catch (e) {
@@ -5235,6 +5848,24 @@ async function startServer() {
       logError(`APIKEY_SAVE_ERROR: ${e?.message || e}`);
       res.status(500).json({ error: e?.message || "Failed to save API key." });
     }
+  });
+  app.get("/api/telegram/status", (_req, res) => {
+    res.json(telegramBridge.status());
+  });
+  app.post("/api/telegram/config", async (req, res) => {
+    try {
+      const token = (req.body?.token ?? "").toString().trim();
+      if (!token) return res.status(400).json({ error: "Bot token is required." });
+      await telegramBridge.setToken(token);
+      res.json(telegramBridge.status());
+    } catch (e) {
+      logError(`TELEGRAM_CONFIG_ERROR: ${e?.message || e}`);
+      res.status(400).json({ error: e?.message || "Failed to configure the Telegram bot." });
+    }
+  });
+  app.post("/api/telegram/unpair", (_req, res) => {
+    telegramBridge.clearPairing();
+    res.json(telegramBridge.status());
   });
   app.get("/api/agent-health", async (_req, res) => {
     try {
@@ -5329,10 +5960,10 @@ async function startServer() {
         return res.status(400).json({ error: "Invalid log file. Use: commands, startup, errors, cognition, or model_history." });
       }
       const logPath = import_path2.default.join(LOGS_DIR, `${fileName}.log`);
-      if (!fs9.existsSync(logPath)) {
+      if (!fs10.existsSync(logPath)) {
         return res.json({ lines: [], file: fileName });
       }
-      const content = fs9.readFileSync(logPath, "utf-8");
+      const content = fs10.readFileSync(logPath, "utf-8");
       const lines = content.split("\n").filter(Boolean).slice(-100);
       res.json({ lines, file: fileName });
     } catch (e) {
@@ -5668,7 +6299,7 @@ ${interceptorScript}`);
       return;
     }
     try {
-      const ai = new import_genai2.GoogleGenAI({
+      const ai = new import_genai3.GoogleGenAI({
         apiKey,
         httpOptions: {
           headers: {
@@ -5797,7 +6428,7 @@ ${presenceInstructions}`,
       const session = await ai.live.connect({
         model: "gemini-3.1-flash-live-preview",
         config: {
-          responseModalities: [import_genai2.Modality.AUDIO],
+          responseModalities: [import_genai3.Modality.AUDIO],
           inputAudioTranscription: {},
           outputAudioTranscription: {},
           speechConfig: {
@@ -5811,10 +6442,10 @@ ${presenceInstructions}`,
                   name: "changeBackground",
                   description: "Changes the visual theme or atmospheric glow color of Amayra's interface.",
                   parameters: {
-                    type: import_genai2.Type.OBJECT,
+                    type: import_genai3.Type.OBJECT,
                     properties: {
                       color: {
-                        type: import_genai2.Type.STRING,
+                        type: import_genai3.Type.STRING,
                         description: "The theme color name (violet, crimson, emerald, celestial, gold, rose, charcoal)"
                       }
                     },
@@ -5825,15 +6456,15 @@ ${presenceInstructions}`,
                   name: "saveCustomMemory",
                   description: "Allows Amayra to immediately save a piece of critical user information to her persistent memory core.",
                   parameters: {
-                    type: import_genai2.Type.OBJECT,
+                    type: import_genai3.Type.OBJECT,
                     properties: {
                       category: {
-                        type: import_genai2.Type.STRING,
+                        type: import_genai3.Type.STRING,
                         description: "The memory category.",
                         enum: ["identity", "preference", "goal", "project", "relationship", "emotional", "behavior"]
                       },
                       text: {
-                        type: import_genai2.Type.STRING,
+                        type: import_genai3.Type.STRING,
                         description: "Precise third-person statement."
                       }
                     },
@@ -5844,10 +6475,10 @@ ${presenceInstructions}`,
                   name: "confirmPendingAction",
                   description: "Executes one pending high-risk action only after the user explicitly confirms it. Use the confirmation_id returned by the original tool response. Never call this before an explicit yes.",
                   parameters: {
-                    type: import_genai2.Type.OBJECT,
+                    type: import_genai3.Type.OBJECT,
                     properties: {
                       confirmation_id: {
-                        type: import_genai2.Type.STRING,
+                        type: import_genai3.Type.STRING,
                         description: "Short-lived confirmation ID returned by the blocked tool action."
                       }
                     },
@@ -5858,11 +6489,11 @@ ${presenceInstructions}`,
                   name: "searchApiCapabilities",
                   description: "Search AMAYRA's internal public API catalogue by capability. Returns only a small ranked provider set with auth, HTTPS, CORS, readiness and health metadata; it does not call the APIs.",
                   parameters: {
-                    type: import_genai2.Type.OBJECT,
+                    type: import_genai3.Type.OBJECT,
                     properties: {
-                      query: { type: import_genai2.Type.STRING, description: "Capability needed, such as weather forecast, rocket launch, IP geolocation, or country information." },
-                      limit: { type: import_genai2.Type.INTEGER, description: "Maximum providers to return (default 6, maximum 12)." },
-                      ready_only: { type: import_genai2.Type.BOOLEAN, description: "Return only no-auth HTTPS providers when true." }
+                      query: { type: import_genai3.Type.STRING, description: "Capability needed, such as weather forecast, rocket launch, IP geolocation, or country information." },
+                      limit: { type: import_genai3.Type.INTEGER, description: "Maximum providers to return (default 6, maximum 12)." },
+                      ready_only: { type: import_genai3.Type.BOOLEAN, description: "Return only no-auth HTTPS providers when true." }
                     },
                     required: ["query"]
                   }
@@ -5871,9 +6502,9 @@ ${presenceInstructions}`,
                   name: "refreshApiCatalogue",
                   description: "Refresh AMAYRA's cached public-apis catalogue from its configured GitHub source. The importer validates and deduplicates entries before replacing the cache.",
                   parameters: {
-                    type: import_genai2.Type.OBJECT,
+                    type: import_genai3.Type.OBJECT,
                     properties: {
-                      force: { type: import_genai2.Type.BOOLEAN, description: "Ignore the normal cache age when true." }
+                      force: { type: import_genai3.Type.BOOLEAN, description: "Ignore the normal cache age when true." }
                     }
                   }
                 },
@@ -5881,9 +6512,9 @@ ${presenceInstructions}`,
                   name: "checkApiProvider",
                   description: "Run a bounded reachability check for one selected provider's documentation URL. This does not prove an API endpoint or adapter is valid.",
                   parameters: {
-                    type: import_genai2.Type.OBJECT,
+                    type: import_genai3.Type.OBJECT,
                     properties: {
-                      provider_id: { type: import_genai2.Type.STRING, description: "Provider ID returned by searchApiCapabilities." }
+                      provider_id: { type: import_genai3.Type.STRING, description: "Provider ID returned by searchApiCapabilities." }
                     },
                     required: ["provider_id"]
                   }
@@ -5892,10 +6523,10 @@ ${presenceInstructions}`,
                   name: "callVerifiedApiAdapter",
                   description: "Execute one already-verified declarative API adapter and return its normalized result. Never invent an adapter ID; use only IDs present in the API hub's verified adapter list.",
                   parameters: {
-                    type: import_genai2.Type.OBJECT,
+                    type: import_genai3.Type.OBJECT,
                     properties: {
-                      adapter_id: { type: import_genai2.Type.STRING, description: "Verified adapter ID from AMAYRA's adapter registry." },
-                      parameters: { type: import_genai2.Type.OBJECT, description: "Only the scalar parameters declared by that adapter." }
+                      adapter_id: { type: import_genai3.Type.STRING, description: "Verified adapter ID from AMAYRA's adapter registry." },
+                      parameters: { type: import_genai3.Type.OBJECT, description: "Only the scalar parameters declared by that adapter." }
                     },
                     required: ["adapter_id", "parameters"]
                   }
@@ -5904,11 +6535,11 @@ ${presenceInstructions}`,
                   name: "convertCurrency",
                   description: "Get a verified current exchange rate from the official no-key Frankfurter v2 adapter and calculate the converted amount. Use directly for requests such as '$1 in INR'.",
                   parameters: {
-                    type: import_genai2.Type.OBJECT,
+                    type: import_genai3.Type.OBJECT,
                     properties: {
-                      amount: { type: import_genai2.Type.NUMBER, description: "Amount to convert (default 1)." },
-                      from_currency: { type: import_genai2.Type.STRING, description: "Three-letter source currency, e.g. USD." },
-                      to_currency: { type: import_genai2.Type.STRING, description: "Three-letter target currency, e.g. INR." }
+                      amount: { type: import_genai3.Type.NUMBER, description: "Amount to convert (default 1)." },
+                      from_currency: { type: import_genai3.Type.STRING, description: "Three-letter source currency, e.g. USD." },
+                      to_currency: { type: import_genai3.Type.STRING, description: "Three-letter target currency, e.g. INR." }
                     },
                     required: ["amount", "from_currency", "to_currency"]
                   }
@@ -5917,302 +6548,302 @@ ${presenceInstructions}`,
                 {
                   name: "openApplication",
                   description: "Open any installed Windows application by name. AMAYRA searches PATH, App Paths, installed apps, Start-menu shortcuts and UWP apps, then falls back to human-style Windows Search keyboard control. It is not restricted to a supported-app list.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { name: { type: import_genai2.Type.STRING, description: "Natural installed application name, e.g. Steam, OBS Studio, Photoshop, Discord, Notepad." } }, required: ["name"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { name: { type: import_genai3.Type.STRING, description: "Natural installed application name, e.g. Steam, OBS Studio, Photoshop, Discord, Notepad." } }, required: ["name"] }
                 },
                 {
                   name: "closeApplication",
                   description: "Close any running desktop application by matching its real window/process, focusing it, and using Alt+F4. This is not restricted to a supported-app list. Set force only when the user explicitly asks to force-close a background or unresponsive process.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { name: { type: import_genai2.Type.STRING, description: "Application name." }, force: { type: import_genai2.Type.BOOLEAN, description: "Force close (default false)." } }, required: ["name"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { name: { type: import_genai3.Type.STRING, description: "Application name." }, force: { type: import_genai3.Type.BOOLEAN, description: "Force close (default false)." } }, required: ["name"] }
                 },
                 {
                   name: "openWebsite",
                   description: "Open a named website or URL in the user's default system browser. Supports shortcuts: youtube, gmail, google, github, chatgpt, etc.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { name: { type: import_genai2.Type.STRING, description: "Site name shortcut (e.g. 'youtube', 'gmail')." }, url: { type: import_genai2.Type.STRING, description: "Full URL if no shortcut." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { name: { type: import_genai3.Type.STRING, description: "Site name shortcut (e.g. 'youtube', 'gmail')." }, url: { type: import_genai3.Type.STRING, description: "Full URL if no shortcut." } } }
                 },
                 {
                   name: "searchWeb",
                   description: "Search a website engine (google, youtube, github, duckduckgo, bing) and open results in the default browser.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { query: { type: import_genai2.Type.STRING, description: "Search query." }, engine: { type: import_genai2.Type.STRING, description: "Engine name (default 'google')." } }, required: ["query"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { query: { type: import_genai3.Type.STRING, description: "Search query." }, engine: { type: import_genai3.Type.STRING, description: "Engine name (default 'google')." } }, required: ["query"] }
                 },
                 {
                   name: "searchYouTube",
                   description: "Search YouTube and open results in the default browser.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { query: { type: import_genai2.Type.STRING, description: "Search query." } }, required: ["query"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { query: { type: import_genai3.Type.STRING, description: "Search query." } }, required: ["query"] }
                 },
                 {
                   name: "searchGoogle",
                   description: "Search Google and open results in the default browser.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { query: { type: import_genai2.Type.STRING, description: "Search query." } }, required: ["query"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { query: { type: import_genai3.Type.STRING, description: "Search query." } }, required: ["query"] }
                 },
                 {
                   name: "searchGitHub",
                   description: "Search GitHub repositories and open results in the default browser.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { query: { type: import_genai2.Type.STRING, description: "Search query." } }, required: ["query"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { query: { type: import_genai3.Type.STRING, description: "Search query." } }, required: ["query"] }
                 },
                 {
                   name: "createFile",
                   description: "Create a new text file with optional content. Scoped to safe folders (Desktop, Documents, Downloads, etc.).",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { path: { type: import_genai2.Type.STRING, description: "File path." }, content: { type: import_genai2.Type.STRING, description: "File content (default empty)." }, overwrite: { type: import_genai2.Type.BOOLEAN, description: "Overwrite if exists (default false)." } }, required: ["path"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { path: { type: import_genai3.Type.STRING, description: "File path." }, content: { type: import_genai3.Type.STRING, description: "File content (default empty)." }, overwrite: { type: import_genai3.Type.BOOLEAN, description: "Overwrite if exists (default false)." } }, required: ["path"] }
                 },
                 {
                   name: "readFile",
                   description: "Read the contents of a text file.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { path: { type: import_genai2.Type.STRING, description: "File path." }, max_chars: { type: import_genai2.Type.INTEGER, description: "Max chars to return (default 8000)." } }, required: ["path"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { path: { type: import_genai3.Type.STRING, description: "File path." }, max_chars: { type: import_genai3.Type.INTEGER, description: "Max chars to return (default 8000)." } }, required: ["path"] }
                 },
                 {
                   name: "renameFile",
                   description: "Rename a file.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { path: { type: import_genai2.Type.STRING, description: "Current file path." }, new_name: { type: import_genai2.Type.STRING, description: "New file name." } }, required: ["path", "new_name"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { path: { type: import_genai3.Type.STRING, description: "Current file path." }, new_name: { type: import_genai3.Type.STRING, description: "New file name." } }, required: ["path", "new_name"] }
                 },
                 {
                   name: "deleteFile",
                   description: "Delete a file. Sends to Recycle Bin by default (safe). Use permanent=true for hard delete.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { path: { type: import_genai2.Type.STRING, description: "File path." }, permanent: { type: import_genai2.Type.BOOLEAN, description: "Permanently delete (default false)." } }, required: ["path"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { path: { type: import_genai3.Type.STRING, description: "File path." }, permanent: { type: import_genai3.Type.BOOLEAN, description: "Permanently delete (default false)." } }, required: ["path"] }
                 },
                 {
                   name: "moveFile",
                   description: "Move a file to a new location.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { path: { type: import_genai2.Type.STRING, description: "Source file path." }, destination: { type: import_genai2.Type.STRING, description: "Destination path or folder." } }, required: ["path", "destination"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { path: { type: import_genai3.Type.STRING, description: "Source file path." }, destination: { type: import_genai3.Type.STRING, description: "Destination path or folder." } }, required: ["path", "destination"] }
                 },
                 {
                   name: "openFolder",
                   description: "Open a folder in File Explorer. Supports aliases: desktop, documents, downloads, pictures, music, videos, home.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { name: { type: import_genai2.Type.STRING, description: "Folder name or alias." }, path: { type: import_genai2.Type.STRING, description: "Full path if no alias." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { name: { type: import_genai3.Type.STRING, description: "Folder name or alias." }, path: { type: import_genai3.Type.STRING, description: "Full path if no alias." } } }
                 },
                 {
                   name: "listFiles",
                   description: "List files in a folder.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { name: { type: import_genai2.Type.STRING, description: "Folder name or alias." }, path: { type: import_genai2.Type.STRING, description: "Full path." }, pattern: { type: import_genai2.Type.STRING, description: "Glob pattern (default '*')." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { name: { type: import_genai3.Type.STRING, description: "Folder name or alias." }, path: { type: import_genai3.Type.STRING, description: "Full path." }, pattern: { type: import_genai3.Type.STRING, description: "Glob pattern (default '*')." } } }
                 },
                 {
                   name: "searchFiles",
                   description: "Search for files by name glob or extension under a folder.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { name: { type: import_genai2.Type.STRING, description: "Filename glob (e.g. '*.py')." }, extension: { type: import_genai2.Type.STRING, description: "File extension (e.g. 'py')." }, folder: { type: import_genai2.Type.STRING, description: "Folder to search (default home)." }, limit: { type: import_genai2.Type.INTEGER, description: "Max results (default 100)." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { name: { type: import_genai3.Type.STRING, description: "Filename glob (e.g. '*.py')." }, extension: { type: import_genai3.Type.STRING, description: "File extension (e.g. 'py')." }, folder: { type: import_genai3.Type.STRING, description: "Folder to search (default home)." }, limit: { type: import_genai3.Type.INTEGER, description: "Max results (default 100)." } } }
                 },
                 {
                   name: "volumeUp",
                   description: "Increase system volume.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { amount: { type: import_genai2.Type.NUMBER, description: "Step amount 0-1 (default 0.1)." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { amount: { type: import_genai3.Type.NUMBER, description: "Step amount 0-1 (default 0.1)." } } }
                 },
                 {
                   name: "volumeDown",
                   description: "Decrease system volume.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { amount: { type: import_genai2.Type.NUMBER, description: "Step amount 0-1 (default 0.1)." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { amount: { type: import_genai3.Type.NUMBER, description: "Step amount 0-1 (default 0.1)." } } }
                 },
                 {
                   name: "setVolume",
                   description: "Set system volume to a specific percentage.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { percent: { type: import_genai2.Type.NUMBER, description: "Volume percentage 0-100." } }, required: ["percent"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { percent: { type: import_genai3.Type.NUMBER, description: "Volume percentage 0-100." } }, required: ["percent"] }
                 },
                 {
                   name: "muteToggle",
                   description: "Toggle mute/unmute on the system volume.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: {} }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: {} }
                 },
                 {
                   name: "requestPowerAction",
                   description: "FIRST STEP for dangerous power actions. Generates a confirmation token. Tell the user verbally, then call executePowerAction with the token if they confirm. Actions: shutdown, restart, sleep, lock.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { action: { type: import_genai2.Type.STRING, description: "Power action: shutdown, restart, sleep, lock." } }, required: ["action"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { action: { type: import_genai3.Type.STRING, description: "Power action: shutdown, restart, sleep, lock." } }, required: ["action"] }
                 },
                 {
                   name: "executePowerAction",
                   description: "SECOND STEP: execute a previously-confirmed power action. Requires a valid execute_token from requestPowerAction. Single-use, expires in 60 seconds.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { action: { type: import_genai2.Type.STRING, description: "The confirmed power action." }, execute_token: { type: import_genai2.Type.STRING, description: "Confirmation token from requestPowerAction." } }, required: ["action", "execute_token"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { action: { type: import_genai3.Type.STRING, description: "The confirmed power action." }, execute_token: { type: import_genai3.Type.STRING, description: "Confirmation token from requestPowerAction." } }, required: ["action", "execute_token"] }
                 },
                 {
                   name: "minimizeWindow",
                   description: "Minimize the active window or a named window.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { title: { type: import_genai2.Type.STRING, description: "Window title to match (optional, defaults to active window)." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { title: { type: import_genai3.Type.STRING, description: "Window title to match (optional, defaults to active window)." } } }
                 },
                 {
                   name: "maximizeWindow",
                   description: "Maximize the active window or a named window.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { title: { type: import_genai2.Type.STRING, description: "Window title to match." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { title: { type: import_genai3.Type.STRING, description: "Window title to match." } } }
                 },
                 {
                   name: "closeWindow",
                   description: "Close the active window or a named window.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { title: { type: import_genai2.Type.STRING, description: "Window title to match." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { title: { type: import_genai3.Type.STRING, description: "Window title to match." } } }
                 },
                 {
                   name: "switchApplication",
                   description: "Switch to a named application window, or cycle Alt+Tab if no title given.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { title: { type: import_genai2.Type.STRING, description: "Window title to switch to." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { title: { type: import_genai3.Type.STRING, description: "Window title to switch to." } } }
                 },
                 {
                   name: "locateText",
                   description: "Read-only exact visible-text targeting. Locates a button, tab, menu, or label using Windows UI Automation or built-in OCR and returns its physical rectangle and center. It never guesses or clicks, and fails on absent or ambiguous labels.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { text: { type: import_genai2.Type.STRING, description: "Exact visible label text." }, window_title: { type: import_genai2.Type.STRING, description: "Optional containing window title." }, occurrence: { type: import_genai2.Type.INTEGER, description: "1-based match only when the exact label legitimately appears multiple times." } }, required: ["text"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { text: { type: import_genai3.Type.STRING, description: "Exact visible label text." }, window_title: { type: import_genai3.Type.STRING, description: "Optional containing window title." }, occurrence: { type: import_genai3.Type.INTEGER, description: "1-based match only when the exact label legitimately appears multiple times." } }, required: ["text"] }
                 },
                 {
                   name: "clickText",
                   description: "Preferred high-accuracy mouse action for every visible labeled control. Resolves the exact label at action time via Windows UI Automation or built-in OCR, moves to its true center, verifies cursor arrival, then clicks. Refuses to click if absent or ambiguous; never substitutes a fuzzy neighboring label.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { text: { type: import_genai2.Type.STRING, description: "Exact visible label text to click." }, window_title: { type: import_genai2.Type.STRING, description: "Optional containing window title; focuses it before locating." }, occurrence: { type: import_genai2.Type.INTEGER, description: "1-based match only when the exact label legitimately appears multiple times." }, button: { type: import_genai2.Type.STRING, enum: ["left", "right"] }, verify_wait: { type: import_genai2.Type.NUMBER, description: "Seconds to wait before visual change verification (0.15 to 2.0)." } }, required: ["text"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { text: { type: import_genai3.Type.STRING, description: "Exact visible label text to click." }, window_title: { type: import_genai3.Type.STRING, description: "Optional containing window title; focuses it before locating." }, occurrence: { type: import_genai3.Type.INTEGER, description: "1-based match only when the exact label legitimately appears multiple times." }, button: { type: import_genai3.Type.STRING, enum: ["left", "right"] }, verify_wait: { type: import_genai3.Type.NUMBER, description: "Seconds to wait before visual change verification (0.15 to 2.0)." } }, required: ["text"] }
                 },
                 {
                   name: "observeDesktopState",
                   description: "Read current cursor, virtual desktop, active window, and optionally visible-window metadata. Use before and after generic GUI actions to verify state changes.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { include_windows: { type: import_genai2.Type.BOOLEAN, description: "Include visible windows (default true)." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { include_windows: { type: import_genai3.Type.BOOLEAN, description: "Include visible windows (default true)." } } }
                 },
                 {
                   name: "getCursorPosition",
                   description: "Read the current mouse cursor coordinates without changing the desktop.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: {} }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: {} }
                 },
                 {
                   name: "getActiveWindow",
                   description: "Read the active window title, process ID, and bounds without changing it.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: {} }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: {} }
                 },
                 {
                   name: "listVisibleWindows",
                   description: "List visible top-level windows with title, process ID, and bounds.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { limit: { type: import_genai2.Type.INTEGER, description: "Maximum windows (default 50, max 100)." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { limit: { type: import_genai3.Type.INTEGER, description: "Maximum windows (default 50, max 100)." } } }
                 },
                 {
                   name: "moveMouse",
                   description: "Move the cursor to validated virtual-desktop coordinates. Returns a fresh desktop observation.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { x: { type: import_genai2.Type.INTEGER }, y: { type: import_genai2.Type.INTEGER }, duration: { type: import_genai2.Type.NUMBER, description: "Bounded movement duration in seconds." } }, required: ["x", "y"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { x: { type: import_genai3.Type.INTEGER }, y: { type: import_genai3.Type.INTEGER }, duration: { type: import_genai3.Type.NUMBER, description: "Bounded movement duration in seconds." } }, required: ["x", "y"] }
                 },
                 {
                   name: "click",
                   description: "Click once at optional validated coordinates, or at the current cursor. Returns a fresh observation; verify the expected UI change.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { x: { type: import_genai2.Type.INTEGER }, y: { type: import_genai2.Type.INTEGER }, button: { type: import_genai2.Type.STRING, enum: ["left", "middle", "right"] } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { x: { type: import_genai3.Type.INTEGER }, y: { type: import_genai3.Type.INTEGER }, button: { type: import_genai3.Type.STRING, enum: ["left", "middle", "right"] } } }
                 },
                 {
                   name: "doubleClick",
                   description: "Double-click at optional validated coordinates. Returns a fresh observation.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { x: { type: import_genai2.Type.INTEGER }, y: { type: import_genai2.Type.INTEGER }, interval: { type: import_genai2.Type.NUMBER } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { x: { type: import_genai3.Type.INTEGER }, y: { type: import_genai3.Type.INTEGER }, interval: { type: import_genai3.Type.NUMBER } } }
                 },
                 {
                   name: "rightClick",
                   description: "Right-click at optional validated coordinates. Returns a fresh observation.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { x: { type: import_genai2.Type.INTEGER }, y: { type: import_genai2.Type.INTEGER } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { x: { type: import_genai3.Type.INTEGER }, y: { type: import_genai3.Type.INTEGER } } }
                 },
                 {
                   name: "drag",
                   description: "Drag from the current cursor or optional start coordinates to validated target coordinates. Returns a fresh observation.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { x: { type: import_genai2.Type.INTEGER }, y: { type: import_genai2.Type.INTEGER }, start_x: { type: import_genai2.Type.INTEGER }, start_y: { type: import_genai2.Type.INTEGER }, duration: { type: import_genai2.Type.NUMBER }, button: { type: import_genai2.Type.STRING, enum: ["left", "right"] } }, required: ["x", "y"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { x: { type: import_genai3.Type.INTEGER }, y: { type: import_genai3.Type.INTEGER }, start_x: { type: import_genai3.Type.INTEGER }, start_y: { type: import_genai3.Type.INTEGER }, duration: { type: import_genai3.Type.NUMBER }, button: { type: import_genai3.Type.STRING, enum: ["left", "right"] } }, required: ["x", "y"] }
                 },
                 {
                   name: "scroll",
                   description: "Scroll a bounded amount at the current cursor or optional validated coordinates. Positive scrolls up; negative scrolls down.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { amount: { type: import_genai2.Type.INTEGER }, x: { type: import_genai2.Type.INTEGER }, y: { type: import_genai2.Type.INTEGER } }, required: ["amount"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { amount: { type: import_genai3.Type.INTEGER }, x: { type: import_genai3.Type.INTEGER }, y: { type: import_genai3.Type.INTEGER } }, required: ["amount"] }
                 },
                 {
                   name: "typeText",
                   description: "Type literal text into the focused control using a bounded per-character interval. Returns a fresh observation.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { text: { type: import_genai2.Type.STRING }, interval: { type: import_genai2.Type.NUMBER } }, required: ["text"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { text: { type: import_genai3.Type.STRING }, interval: { type: import_genai3.Type.NUMBER } }, required: ["text"] }
                 },
                 {
                   name: "pressKey",
                   description: "Press one validated keyboard key a bounded number of times.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { key: { type: import_genai2.Type.STRING }, presses: { type: import_genai2.Type.INTEGER }, interval: { type: import_genai2.Type.NUMBER } }, required: ["key"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { key: { type: import_genai3.Type.STRING }, presses: { type: import_genai3.Type.INTEGER }, interval: { type: import_genai3.Type.NUMBER } }, required: ["key"] }
                 },
                 {
                   name: "hotkey",
                   description: "Press a validated combination of 2 to 5 keyboard keys.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { keys: { type: import_genai2.Type.ARRAY, items: { type: import_genai2.Type.STRING } } }, required: ["keys"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { keys: { type: import_genai3.Type.ARRAY, items: { type: import_genai3.Type.STRING } } }, required: ["keys"] }
                 },
                 {
                   name: "waitForUi",
                   description: "Wait up to five seconds for a UI transition, then return fresh desktop metadata and whether the active title changed.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { seconds: { type: import_genai2.Type.NUMBER }, previous_title: { type: import_genai2.Type.STRING }, include_windows: { type: import_genai2.Type.BOOLEAN } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { seconds: { type: import_genai3.Type.NUMBER }, previous_title: { type: import_genai3.Type.STRING }, include_windows: { type: import_genai3.Type.BOOLEAN } } }
                 },
                 {
                   name: "copySelected",
                   description: "Copy selected text: sends Ctrl+C and reads the clipboard.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { wait: { type: import_genai2.Type.NUMBER, description: "Seconds to wait after Ctrl+C (default 0.35)." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { wait: { type: import_genai3.Type.NUMBER, description: "Seconds to wait after Ctrl+C (default 0.35)." } } }
                 },
                 {
                   name: "pasteClipboard",
                   description: "Paste text into the active input. Writes text to clipboard then sends Ctrl+V.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { text: { type: import_genai2.Type.STRING, description: "Text to paste. If omitted, pastes current clipboard." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { text: { type: import_genai3.Type.STRING, description: "Text to paste. If omitted, pastes current clipboard." } } }
                 },
                 {
                   name: "getClipboard",
                   description: "Read the current clipboard text content.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { max_chars: { type: import_genai2.Type.INTEGER, description: "Max chars (default 1000)." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { max_chars: { type: import_genai3.Type.INTEGER, description: "Max chars (default 1000)." } } }
                 },
                 {
                   name: "clearClipboard",
                   description: "Empty the clipboard.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: {} }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: {} }
                 },
                 {
                   name: "takeScreenshot",
                   description: "Capture the full screen. Optionally include base64 image data.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { include_image: { type: import_genai2.Type.BOOLEAN, description: "Include base64 JPEG image (default false)." }, max_dim: { type: import_genai2.Type.INTEGER, description: "Max image dimension (default 1280)." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { include_image: { type: import_genai3.Type.BOOLEAN, description: "Include base64 JPEG image (default false)." }, max_dim: { type: import_genai3.Type.INTEGER, description: "Max image dimension (default 1280)." } } }
                 },
                 {
                   name: "saveScreenshot",
                   description: "Save a screenshot to Pictures/AmayraScreenshots.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { name: { type: import_genai2.Type.STRING, description: "Optional filename prefix." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { name: { type: import_genai3.Type.STRING, description: "Optional filename prefix." } } }
                 },
                 {
                   name: "analyzeScreenshot",
                   description: "Take a screenshot and run OCR to extract visible text from the screen.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { max_chars: { type: import_genai2.Type.INTEGER, description: "Max OCR chars (default 1500)." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { max_chars: { type: import_genai3.Type.INTEGER, description: "Max OCR chars (default 1500)." } } }
                 },
                 {
                   name: "readScreen",
                   description: "OCR the active window and return its title plus visible text.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { max_chars: { type: import_genai2.Type.INTEGER, description: "Max OCR chars (default 1500)." } } }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { max_chars: { type: import_genai3.Type.INTEGER, description: "Max OCR chars (default 1500)." } } }
                 },
                 {
                   name: "viewScreen",
                   description: "Capture the current desktop for the AI to see. Returns a downsized JPEG plus the active window title. The bridge also pushes the frame into the live multimodal stream automatically, so just call this and then answer the user's question about what is on their screen.",
                   parameters: {
-                    type: import_genai2.Type.OBJECT,
+                    type: import_genai3.Type.OBJECT,
                     properties: {
-                      max_dim: { type: import_genai2.Type.INTEGER, description: "Max image dimension in pixels (default 1024, range 320-1920)." },
-                      keep_file: { type: import_genai2.Type.BOOLEAN, description: "Persist a copy of the frame under the OS temp dir (default false)." }
+                      max_dim: { type: import_genai3.Type.INTEGER, description: "Max image dimension in pixels (default 1024, range 320-1920)." },
+                      keep_file: { type: import_genai3.Type.BOOLEAN, description: "Persist a copy of the frame under the OS temp dir (default false)." }
                     }
                   }
                 },
                 {
                   name: "createPythonFile",
                   description: "Create a Python (.py) file with content.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { path: { type: import_genai2.Type.STRING, description: "File path." }, content: { type: import_genai2.Type.STRING, description: "Python code content." }, overwrite: { type: import_genai2.Type.BOOLEAN, description: "Overwrite if exists." } }, required: ["path"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { path: { type: import_genai3.Type.STRING, description: "File path." }, content: { type: import_genai3.Type.STRING, description: "Python code content." }, overwrite: { type: import_genai3.Type.BOOLEAN, description: "Overwrite if exists." } }, required: ["path"] }
                 },
                 {
                   name: "writeCodeFile",
                   description: "Create a code file in any language with appropriate extension.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { path: { type: import_genai2.Type.STRING, description: "File path." }, content: { type: import_genai2.Type.STRING, description: "Code content." }, language: { type: import_genai2.Type.STRING, description: "Language name (e.g. 'python', 'javascript', 'html')." }, overwrite: { type: import_genai2.Type.BOOLEAN, description: "Overwrite if exists." } }, required: ["path"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { path: { type: import_genai3.Type.STRING, description: "File path." }, content: { type: import_genai3.Type.STRING, description: "Code content." }, language: { type: import_genai3.Type.STRING, description: "Language name (e.g. 'python', 'javascript', 'html')." }, overwrite: { type: import_genai3.Type.BOOLEAN, description: "Overwrite if exists." } }, required: ["path"] }
                 },
                 {
                   name: "createProjectFolder",
                   description: "Create a project folder structure with optional subfolders and starter files.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { path: { type: import_genai2.Type.STRING, description: "Project root folder path." }, subfolders: { type: import_genai2.Type.ARRAY, items: { type: import_genai2.Type.STRING }, description: "List of subfolder names." }, scaffold_standard: { type: import_genai2.Type.BOOLEAN, description: "Create src, tests, docs subfolders." }, files: { type: import_genai2.Type.OBJECT, description: "Object of relative-path -> content for starter files." } }, required: ["path"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { path: { type: import_genai3.Type.STRING, description: "Project root folder path." }, subfolders: { type: import_genai3.Type.ARRAY, items: { type: import_genai3.Type.STRING }, description: "List of subfolder names." }, scaffold_standard: { type: import_genai3.Type.BOOLEAN, description: "Create src, tests, docs subfolders." }, files: { type: import_genai3.Type.OBJECT, description: "Object of relative-path -> content for starter files." } }, required: ["path"] }
                 },
                 {
                   name: "runPythonScript",
                   description: "Execute a Python script and capture stdout, stderr, and exit code. Has a configurable timeout.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: { path: { type: import_genai2.Type.STRING, description: "Script path." }, args: { type: import_genai2.Type.ARRAY, items: { type: import_genai2.Type.STRING }, description: "Script arguments." }, timeout: { type: import_genai2.Type.INTEGER, description: "Timeout in seconds (default 30)." } }, required: ["path"] }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: { path: { type: import_genai3.Type.STRING, description: "Script path." }, args: { type: import_genai3.Type.ARRAY, items: { type: import_genai3.Type.STRING }, description: "Script arguments." }, timeout: { type: import_genai3.Type.INTEGER, description: "Timeout in seconds (default 30)." } }, required: ["path"] }
                 },
                 {
                   name: "systemInfo",
                   description: "Get system resource usage: CPU %, RAM %, disk usage, uptime, OS info.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: {} }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: {} }
                 },
                 {
                   name: "gpuInfo",
                   description: "Get NVIDIA GPU stats: utilization %, VRAM usage, temperature. Graceful fallback if no NVIDIA GPU.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: {} }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: {} }
                 },
                 {
                   name: "temperatureInfo",
                   description: "Get available temperature readings (CPU, GPU, etc.). Best-effort on Windows.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: {} }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: {} }
                 },
                 // --- V2: Brightness control ---
                 {
                   name: "brightnessUp",
                   description: "Increase screen brightness by a step (default 10%). Use when user says 'increase brightness' or 'make screen brighter'.",
                   parameters: {
-                    type: import_genai2.Type.OBJECT,
+                    type: import_genai3.Type.OBJECT,
                     properties: {
-                      amount: { type: import_genai2.Type.NUMBER, description: "Percentage to increase (default 10)." }
+                      amount: { type: import_genai3.Type.NUMBER, description: "Percentage to increase (default 10)." }
                     }
                   }
                 },
@@ -6220,9 +6851,9 @@ ${presenceInstructions}`,
                   name: "brightnessDown",
                   description: "Decrease screen brightness by a step (default 10%). Use when user says 'decrease brightness' or 'dim screen'.",
                   parameters: {
-                    type: import_genai2.Type.OBJECT,
+                    type: import_genai3.Type.OBJECT,
                     properties: {
-                      amount: { type: import_genai2.Type.NUMBER, description: "Percentage to decrease (default 10)." }
+                      amount: { type: import_genai3.Type.NUMBER, description: "Percentage to decrease (default 10)." }
                     }
                   }
                 },
@@ -6230,9 +6861,9 @@ ${presenceInstructions}`,
                   name: "setBrightness",
                   description: "Set screen brightness to an exact level. Use when user says 'set brightness to 50%' or 'brightness 80'.",
                   parameters: {
-                    type: import_genai2.Type.OBJECT,
+                    type: import_genai3.Type.OBJECT,
                     properties: {
-                      percent: { type: import_genai2.Type.NUMBER, description: "Target brightness 0-100." }
+                      percent: { type: import_genai3.Type.NUMBER, description: "Target brightness 0-100." }
                     },
                     required: ["percent"]
                   }
@@ -6241,17 +6872,17 @@ ${presenceInstructions}`,
                 {
                   name: "enableAutoStart",
                   description: "Enable AMAYRA to launch automatically when Windows starts. Creates a silent startup entry.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: {} }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: {} }
                 },
                 {
                   name: "disableAutoStart",
                   description: "Disable AMAYRA auto-start on Windows login. Removes the startup entry.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: {} }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: {} }
                 },
                 {
                   name: "getAutoStartStatus",
                   description: "Check whether AMAYRA is currently configured to auto-start on Windows login.",
-                  parameters: { type: import_genai2.Type.OBJECT, properties: {} }
+                  parameters: { type: import_genai3.Type.OBJECT, properties: {} }
                 }
               ]
             }
@@ -6952,8 +7583,10 @@ The one-shot screen capture was unavailable. Say clearly that you could not acce
       errorProtocol.report({ severity: "degraded", scope: "boot.desktopAgent", message });
     });
     startAgentWatchdog();
+    telegramBridge.start();
   });
   const shutdownCognition = () => {
+    telegramBridge.stop();
     stopAgentWatchdog();
     desktopPerception.stop();
     void cognition.shutdown().catch(

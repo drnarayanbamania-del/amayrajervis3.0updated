@@ -50,6 +50,7 @@ import {
   type ScreenVisionFrame,
 } from "./server_screenVision";
 import { ApiHubService, type ApiProviderStatus } from "./api_hub";
+import { TelegramBridge } from "./server_telegram";
 
 dotenv.config();
 
@@ -859,6 +860,46 @@ async function startServer() {
     });
   cognitionEventPublisher = (event) => { void processCognitiveEvent(event); };
 
+  // ---------------------------------------------------------------------------
+  // Telegram bridge — the owner can chat with AMAYRA and drive the same
+  // tool-execution path (safety policy included) from their Telegram bot.
+  // ---------------------------------------------------------------------------
+  const telegramBridge = new TelegramBridge({
+    configPath: dataFile("telegram.json"),
+    getApiKey: () => getGeminiApiKey(),
+    retrieveMemories: async (text) => {
+      const recalled = await cognition.memories.retrieve({
+        text,
+        projectId: cognition.situation.getSnapshot().currentProject,
+        limit: 5,
+        minConfidence: 0.3,
+      });
+      return recalled.map((memory) => ({ text: memory.content }));
+    },
+    executeTool: async (tool, args) => {
+      const outcome = await toolExecutor.execute(tool, args, { correlationId: `telegram-${randomUUID()}` });
+      return {
+        success: outcome.success,
+        status: outcome.status,
+        result: outcome.result,
+        error: outcome.error,
+        confirmationId: outcome.confirmationId,
+      };
+    },
+    confirmTool: (confirmationId) => toolExecutor.confirm(confirmationId),
+    publishEvent: (event) => { void processCognitiveEvent(event); },
+    reportError: (severity, scope, message) => errorProtocol.report({ severity, scope, message }),
+    logCommand,
+    logStartup,
+    logError,
+    collectStatus: async () => {
+      const agentAlive = await isDesktopAgentAlive();
+      const situation = cognition.situation.getSnapshot();
+      const agentInfo = agentAlive ? `online (${await fetchAgentToolCount()} tools)` : "offline";
+      return `Core state: ${situation.state} · desktop agent: ${agentInfo}`;
+    },
+  });
+
   const desktopPerception = new DesktopPerception({
     fetchSnapshot: fetchDesktopObservation,
     emit: (event) => processCognitiveEvent(event).then(() => undefined),
@@ -1265,6 +1306,28 @@ async function startServer() {
       logError(`APIKEY_SAVE_ERROR: ${e?.message || e}`);
       res.status(500).json({ error: e?.message || "Failed to save API key." });
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Telegram bridge administration. The bot token never returns to clients.
+  // ---------------------------------------------------------------------------
+  app.get("/api/telegram/status", (_req, res) => {
+    res.json(telegramBridge.status());
+  });
+  app.post("/api/telegram/config", async (req, res) => {
+    try {
+      const token = (req.body?.token ?? "").toString().trim();
+      if (!token) return res.status(400).json({ error: "Bot token is required." });
+      await telegramBridge.setToken(token);
+      res.json(telegramBridge.status());
+    } catch (e: any) {
+      logError(`TELEGRAM_CONFIG_ERROR: ${e?.message || e}`);
+      res.status(400).json({ error: e?.message || "Failed to configure the Telegram bot." });
+    }
+  });
+  app.post("/api/telegram/unpair", (_req, res) => {
+    telegramBridge.clearPairing();
+    res.json(telegramBridge.status());
   });
 
   // V2: Agent health proxy (for the Settings panel — avoids direct :8765 call
@@ -3270,9 +3333,11 @@ async function startServer() {
         errorProtocol.report({ severity: "degraded", scope: "boot.desktopAgent", message });
       });
     startAgentWatchdog();
+    telegramBridge.start();
   });
 
   const shutdownCognition = () => {
+    telegramBridge.stop();
     stopAgentWatchdog();
     desktopPerception.stop();
     void cognition.shutdown().catch((error) =>
