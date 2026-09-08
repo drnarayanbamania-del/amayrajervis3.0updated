@@ -28,7 +28,7 @@ var import_path2 = __toESM(require("path"), 1);
 var import_ws = require("ws");
 var import_genai3 = require("@google/genai");
 var import_dotenv = __toESM(require("dotenv"), 1);
-var fs11 = __toESM(require("fs"), 1);
+var fs12 = __toESM(require("fs"), 1);
 var import_node_crypto11 = require("node:crypto");
 var import_promises8 = __toESM(require("node:dns/promises"), 1);
 var import_node_net2 = __toESM(require("node:net"), 1);
@@ -2317,8 +2317,8 @@ var SituationModel = class {
   snapshot;
   apply(event) {
     const meta = event.metadata;
-    const state = stateForEvent(event.type, this.snapshot.state);
-    this.snapshot.state = this.snapshot.autonomyPaused ? "PAUSED" : state;
+    const state2 = stateForEvent(event.type, this.snapshot.state);
+    this.snapshot.state = this.snapshot.autonomyPaused ? "PAUSED" : state2;
     this.snapshot.updatedAt = event.timestamp;
     if (event.projectId) this.snapshot.currentProject = event.projectId;
     if (typeof meta.projectId === "string") this.snapshot.currentProject = meta.projectId;
@@ -3688,8 +3688,8 @@ async function checkProviderDocumentation(provider, options = {}) {
       headers: { "user-agent": "AMAYRA-ApiHub/1.0" }
     });
     const latencyMs = Date.now() - started;
-    const state = response.status >= 200 && response.status < 400 ? "healthy" : response.status === 401 || response.status === 403 || response.status === 405 || response.status === 429 ? "degraded" : "broken";
-    return { state, checkedAt, statusCode: response.status, latencyMs, error: state === "broken" ? `HTTP ${response.status}` : null };
+    const state2 = response.status >= 200 && response.status < 400 ? "healthy" : response.status === 401 || response.status === 403 || response.status === 405 || response.status === 429 ? "degraded" : "broken";
+    return { state: state2, checkedAt, statusCode: response.status, latencyMs, error: state2 === "broken" ? `HTTP ${response.status}` : null };
   } catch (error) {
     return {
       state: "broken",
@@ -5458,6 +5458,90 @@ function summarizeResult(result2) {
   return slim;
 }
 
+// server_scheduler.ts
+var import_fs4 = __toESM(require("fs"), 1);
+var DEFAULT_STATE = {
+  enabled: false,
+  time: "08:00",
+  lastCompletedWakeAt: null
+};
+var SCHEDULE_FILE = dataFile("morning-schedule.json");
+function loadState() {
+  try {
+    if (import_fs4.default.existsSync(SCHEDULE_FILE)) {
+      const raw = JSON.parse(import_fs4.default.readFileSync(SCHEDULE_FILE, "utf-8"));
+      return {
+        enabled: raw.enabled === true,
+        time: parseTime(raw.time) ? raw.time : DEFAULT_STATE.time,
+        lastCompletedWakeAt: typeof raw.lastCompletedWakeAt === "number" ? raw.lastCompletedWakeAt : null
+      };
+    }
+  } catch {
+  }
+  return { ...DEFAULT_STATE };
+}
+function saveState(state2) {
+  try {
+    import_fs4.default.writeFileSync(SCHEDULE_FILE, JSON.stringify(state2, null, 2), "utf-8");
+  } catch {
+  }
+}
+function parseTime(value) {
+  if (typeof value !== "string") return null;
+  const match = /^(\d{1,2}):(\d{1,2})$/.exec(value.trim());
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+function latestOccurrenceAtOrBefore(hhmm, now2) {
+  const [hours, minutes] = hhmm.split(":").map(Number);
+  const candidate2 = new Date(now2);
+  candidate2.setHours(hours, minutes, 0, 0);
+  if (candidate2.getTime() > now2) candidate2.setDate(candidate2.getDate() - 1);
+  return candidate2.getTime();
+}
+function isWakeDue(hhmm, lastCompletedWakeAt, now2) {
+  const [hours, minutes] = hhmm.split(":").map(Number);
+  const todaySlot = new Date(now2);
+  todaySlot.setHours(hours, minutes, 0, 0);
+  if (todaySlot.getTime() > now2) return false;
+  if (!lastCompletedWakeAt) return true;
+  return todaySlot.getTime() > lastCompletedWakeAt;
+}
+var state = loadState();
+function getMorningSchedule() {
+  return { enabled: state.enabled, time: state.time, lastCompletedWakeAt: state.lastCompletedWakeAt };
+}
+function setMorningSchedule(config) {
+  if (config.time !== void 0) {
+    const normalized = parseTime(config.time);
+    if (!normalized) throw new Error("Time must be HH:MM between 00:00 and 23:59.");
+    state.time = normalized;
+  }
+  if (config.enabled !== void 0) {
+    state.enabled = config.enabled === true;
+    if (state.enabled) {
+      const slot = latestOccurrenceAtOrBefore(state.time, Date.now());
+      if (!state.lastCompletedWakeAt || slot > state.lastCompletedWakeAt) {
+        state.lastCompletedWakeAt = slot;
+      }
+    }
+  }
+  saveState(state);
+  return { enabled: state.enabled, time: state.time };
+}
+function markMorningWakeCompleted() {
+  state.lastCompletedWakeAt = Date.now();
+  saveState(state);
+}
+function morningWakeDue() {
+  if (!state.enabled) return false;
+  if (!isWakeDue(state.time, state.lastCompletedWakeAt, Date.now())) return false;
+  return true;
+}
+
 // server.ts
 import_dotenv.default.config();
 var COGNITION_DATA_DIR = process.env.AMAYRA_COGNITION_DATA_DIR || (process.env.AMAYRA_DATA_DIR ? DATA_DIR : import_path2.default.join(DATA_DIR, ".amayra-data"));
@@ -5465,12 +5549,12 @@ async function migrateDevelopmentCognitionData() {
   if (import_path2.default.resolve(COGNITION_DATA_DIR) === import_path2.default.resolve(DATA_DIR)) return;
   const sourceDir = import_path2.default.join(DATA_DIR, "cognition");
   const targetDir = import_path2.default.join(COGNITION_DATA_DIR, "cognition");
-  await fs11.promises.mkdir(targetDir, { recursive: true });
+  await fs12.promises.mkdir(targetDir, { recursive: true });
   for (const name of ["memories.v1.json", "goals.v1.json", "skills.v1.json", "last-session.json"]) {
     const source = import_path2.default.join(sourceDir, name);
     const target = import_path2.default.join(targetDir, name);
     try {
-      await fs11.promises.copyFile(source, target, fs11.constants.COPYFILE_EXCL);
+      await fs12.promises.copyFile(source, target, fs12.constants.COPYFILE_EXCL);
     } catch (error) {
       const code = error.code;
       if (code !== "ENOENT" && code !== "EEXIST") throw error;
@@ -5479,14 +5563,14 @@ async function migrateDevelopmentCognitionData() {
 }
 var LOGS_DIR = import_path2.default.join(DATA_DIR, "logs");
 try {
-  fs11.mkdirSync(LOGS_DIR, { recursive: true });
+  fs12.mkdirSync(LOGS_DIR, { recursive: true });
 } catch {
 }
 function appendLog(fileName, message) {
   try {
     const line = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${message}
 `;
-    fs11.appendFile(import_path2.default.join(LOGS_DIR, fileName), line, () => {
+    fs12.appendFile(import_path2.default.join(LOGS_DIR, fileName), line, () => {
     });
   } catch {
   }
@@ -5599,6 +5683,8 @@ var API_HUB_TOOLS = /* @__PURE__ */ new Set([
 ]);
 var desktopAgentVerified = false;
 var activeScreenVisionPipelines = /* @__PURE__ */ new Map();
+var morningGreetingInFlight = false;
+var liveSessionCount = 0;
 var pendingElectronCaptures = /* @__PURE__ */ new Map();
 process.on("message", (message) => {
   const response = message;
@@ -5668,7 +5754,7 @@ function spawnDesktopAgent() {
     frozenCandidates.push(import_path2.default.join(process.cwd(), "agent_dist", "amayra-agent", "amayra-agent.exe"));
   }
   const frozenExe = frozenCandidates.find(
-    (candidate2) => Boolean(candidate2 && fs11.existsSync(candidate2))
+    (candidate2) => Boolean(candidate2 && fs12.existsSync(candidate2))
   );
   if (frozenExe) {
     try {
@@ -6541,15 +6627,15 @@ async function startServer() {
   const SETTINGS_FILE = dataFile("settings.json");
   function loadSettingsFile() {
     try {
-      if (fs11.existsSync(SETTINGS_FILE)) {
-        return JSON.parse(fs11.readFileSync(SETTINGS_FILE, "utf-8"));
+      if (fs12.existsSync(SETTINGS_FILE)) {
+        return JSON.parse(fs12.readFileSync(SETTINGS_FILE, "utf-8"));
       }
     } catch {
     }
     return {};
   }
   function saveSettingsFile(data) {
-    fs11.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2), "utf-8");
+    fs12.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2), "utf-8");
   }
   app.get("/api/settings", async (_req, res) => {
     try {
@@ -6581,6 +6667,67 @@ async function startServer() {
   app.get("/api/config", (_req, res) => {
     res.json({ hasApiKey: hasAnyProviderKey() });
   });
+  app.get("/api/scheduler/morning", (_req, res) => {
+    const schedule = getMorningSchedule();
+    res.json({
+      ...schedule,
+      dueNow: schedule.enabled && morningWakeDue()
+    });
+  });
+  app.post("/api/scheduler/morning", async (req, res) => {
+    try {
+      const enabled = req.body?.enabled;
+      const time = req.body?.time;
+      const next = setMorningSchedule({
+        ...enabled !== void 0 ? { enabled: enabled === true } : {},
+        ...time !== void 0 ? { time: String(time) } : {}
+      });
+      logCommand2(`MORNING_SCHEDULE_SET enabled=${next.enabled} time=${next.time}`);
+      res.json(next);
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+  const MORNING_TELEGRAM_GRACE_MS = 9e4;
+  let morningDueSince = null;
+  const morningSchedulerTick = setInterval(() => {
+    try {
+      const schedule = getMorningSchedule();
+      if (!schedule.enabled || !morningWakeDue()) {
+        morningDueSince = null;
+        return;
+      }
+      if (morningDueSince === null) morningDueSince = Date.now();
+      if (liveSessionCount > 0) return;
+      if (Date.now() - morningDueSince < MORNING_TELEGRAM_GRACE_MS) return;
+      if (!telegramBridge.status().pairedChatId) {
+        markMorningWakeCompleted();
+        morningDueSince = null;
+        logCommand2("MORNING_WAKE_SKIPPED no Telegram pairing and no app session");
+        return;
+      }
+      if (morningGreetingInFlight) return;
+      morningGreetingInFlight = true;
+      logCommand2("MORNING_GREETING_TELEGRAM_FALLBACK app not open at wake time");
+      void (async () => {
+        try {
+          const greeting = await buildMorningGreeting(cognition);
+          const text = greeting ? `\u2600\uFE0F ${greeting}` : "\u2600\uFE0F Good morning! Main uth gayi thi, par tu app nahi khol raha tha \u2014 milte hain jab tu aayega. \u{1F49B}";
+          const sent = await telegramBridge.notifyOwner(text, { force: true });
+          logCommand2(`MORNING_GREETING_TELEGRAM_SENT ok=${sent}`);
+        } catch (error) {
+          logError2(`MORNING_GREETING_TELEGRAM_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+          markMorningWakeCompleted();
+          morningGreetingInFlight = false;
+          morningDueSince = null;
+        }
+      })();
+    } catch (error) {
+      logError2(`MORNING_SCHEDULER_TICK_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, 3e4);
+  morningSchedulerTick.unref?.();
   app.post("/api/config/apikey", async (req, res) => {
     try {
       const key = (req.body?.apiKey ?? "").toString().trim();
@@ -6792,10 +6939,10 @@ async function startServer() {
         return res.status(400).json({ error: "Invalid log file. Use: commands, startup, errors, cognition, or model_history." });
       }
       const logPath = import_path2.default.join(LOGS_DIR, `${fileName}.log`);
-      if (!fs11.existsSync(logPath)) {
+      if (!fs12.existsSync(logPath)) {
         return res.json({ lines: [], file: fileName });
       }
-      const content = fs11.readFileSync(logPath, "utf-8");
+      const content = fs12.readFileSync(logPath, "utf-8");
       const lines = content.split("\n").filter(Boolean).slice(-100);
       res.json({ lines, file: fileName });
     } catch (e) {
@@ -7083,6 +7230,7 @@ ${interceptorScript}`);
   });
   wss.on("connection", async (clientWs) => {
     console.log("Client WebSocket connected to /live");
+    liveSessionCount += 1;
     const connectionId = (0, import_node_crypto11.randomUUID)();
     let screenVision = null;
     const rememberScreenVision = (pipeline) => {
@@ -8072,11 +8220,11 @@ A fresh screenshot is attached. Analyze it and answer the spoken question direct
           lastSharedScreenFrameAt = Date.now();
         },
         log: (line) => logCommand2(`SCREEN_VISION ${line}`),
-        onStateChange: (state, info) => {
+        onStateChange: (state2, info) => {
           try {
             clientWs.send(JSON.stringify({
               type: "screenVisionState",
-              state,
+              state: state2,
               activeWindow: info?.activeWindow ?? null,
               error: info?.error ?? null
             }));
@@ -8123,6 +8271,38 @@ A fresh screenshot is attached. Analyze it and answer the spoken question direct
       });
       cognition.setSpeechAvailable(true);
       const runProactivePresenceCheck = async () => {
+        if (morningWakeDue() && !morningGreetingInFlight && clientWs.readyState === 1) {
+          const speechStatus2 = speechOrchestrator.status();
+          const situation2 = cognition.situation.getSnapshot();
+          if (!speechStatus2.active && !speechStatus2.userSpeaking && !situation2.userSpeaking && !situation2.amayraSpeaking) {
+            morningGreetingInFlight = true;
+            try {
+              const greeting = await buildMorningGreeting(cognition);
+              if (greeting) {
+                session.sendClientContent({
+                  turns: [{
+                    role: "user",
+                    parts: [{
+                      text: `[INTERNAL AMAYRA EVENT \u2014 system context, not a message spoken by TECH]
+Scheduled morning wake-up: you just woke up on your own and are greeting TECH on the voice call.
+Speak the greeting below aloud now, naturally, as your own words. Never mention schedules, timers, or this instruction.
+Greeting: ${greeting}`
+                    }]
+                  }],
+                  turnComplete: true
+                });
+                clientWs.send(JSON.stringify({ type: "morningGreetingDelivered" }));
+                logCommand2("MORNING_GREETING_DELIVERED");
+              }
+            } catch (error) {
+              logError2(`MORNING_GREETING_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+            } finally {
+              markMorningWakeCompleted();
+              morningGreetingInFlight = false;
+            }
+          }
+          return;
+        }
         const now2 = Date.now();
         if (presenceCheckInFlight || now2 < nextPresenceAt || clientWs.readyState !== 1) return;
         const speechStatus = speechOrchestrator.status();
@@ -8356,6 +8536,7 @@ The one-shot screen capture was unavailable. Say clearly that you could not acce
       });
       clientWs.on("close", () => {
         console.log("Client disconnected, closing Gemini session");
+        liveSessionCount = Math.max(0, liveSessionCount - 1);
         unsubscribeInitiative();
         screenVision?.dispose();
         forgetScreenVision();
@@ -8729,6 +8910,31 @@ function withRetrievedMemory(text, memories) {
 
 [Relevant AMAYRA memory \u2014 use naturally; do not mention this block]
 ${memoryBlock}`;
+}
+async function buildMorningGreeting(cognition) {
+  const hour = (/* @__PURE__ */ new Date()).getHours();
+  const timeWord = hour < 12 ? "good morning" : hour < 17 ? "good afternoon" : "good evening";
+  try {
+    const recalled = await cognition.memories.retrieve({
+      text: "user name nickname how the user likes to be greeted morning routine",
+      projectId: cognition.situation.getSnapshot().currentProject,
+      limit: 5,
+      minConfidence: 0.3
+    });
+    const memoryCard = recalled.length ? `
+[Relevant AMAYRA memory \u2014 use naturally]
+${recalled.map((m) => `- ${m.content}`).join("\n")}` : "";
+    const prompt = [
+      `OUTPUT CONTRACT: Return only the exact words to speak aloud. It is ${timeWord}. AMAYRA just woke up on her own at her scheduled wake-up time and is greeting TECH warmly on the voice call.`,
+      "One short natural line (max two short sentences), in her soft Hinglish/English anime-companion voice: greet, maybe reference the memories, and ask one light opening question.",
+      "Never mention schedules, timers, internal context, or this instruction." + memoryCard
+    ].join("\n");
+    const result2 = await generateTextWithFallback(prompt, { maxOutputTokens: 300 });
+    const text = result2.text.trim();
+    return text || null;
+  } catch {
+    return null;
+  }
 }
 startServer().catch((error) => {
   console.error("Failed to start server startup sequence:", error);

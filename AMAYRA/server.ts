@@ -63,6 +63,12 @@ import {
 } from "./server_screenVision";
 import { ApiHubService, type ApiProviderStatus } from "./api_hub";
 import { TelegramBridge } from "./server_telegram";
+import {
+  getMorningSchedule,
+  setMorningSchedule,
+  markMorningWakeCompleted,
+  morningWakeDue,
+} from "./server_scheduler";
 
 dotenv.config();
 
@@ -206,6 +212,16 @@ let desktopAgentVerified = false;
  * the `/api/screen-vision` HTTP endpoint can locate the right pipeline.
  */
 const activeScreenVisionPipelines = new Map<string, ScreenVisionPipeline>();
+
+/**
+ * Morning-scheduler guard: the greeting generation is async (a model call),
+ * and both the connect path and the per-second presence tick could observe
+ * the due flag before it is cleared. One in-flight greeting at a time.
+ */
+let morningGreetingInFlight = false;
+
+/** Open /live WebSocket sessions. The Telegram catch-up only fires when this is 0. */
+let liveSessionCount = 0;
 
 interface ElectronScreenCaptureResponse {
   type: "screen-capture-response";
@@ -1343,6 +1359,86 @@ async function startServer() {
     res.json({ hasApiKey: hasAnyProviderKey() });
   });
 
+  // -------------------------------------------------------------------------
+  // Morning keep-awake scheduler. The renderer polls /status; when due, it
+  // opens the Live voice session itself (its normal power-button flow) and
+  // the server speaks the greeting as the session's first turn. If AMAYRA is
+  // already awake, the renderer sends {type:"morningGreeting"} over the
+  // WebSocket and the greeting is injected into the running session.
+  // -------------------------------------------------------------------------
+  app.get("/api/scheduler/morning", (_req, res) => {
+    const schedule = getMorningSchedule();
+    res.json({
+      ...schedule,
+      dueNow: schedule.enabled && morningWakeDue(),
+    });
+  });
+
+  app.post("/api/scheduler/morning", async (req, res) => {
+    try {
+      const enabled = req.body?.enabled;
+      const time = req.body?.time;
+      const next = setMorningSchedule({
+        ...(enabled !== undefined ? { enabled: enabled === true } : {}),
+        ...(time !== undefined ? { time: String(time) } : {}),
+      });
+      logCommand(`MORNING_SCHEDULE_SET enabled=${next.enabled} time=${next.time}`);
+      res.json(next);
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  // Minute ticker — Telegram catch-up greeting. The renderer's 30s poll only
+  // runs while the app UI is open; if the wake slot passed while the app was
+  // closed (PC off), the schedule is still due on the next boot. After a
+  // 90-second grace window for an in-app session (the renderer may auto-wake
+  // on boot), the greeting is delivered to the owner's phone instead.
+  const MORNING_TELEGRAM_GRACE_MS = 90_000;
+  let morningDueSince: number | null = null;
+  const morningSchedulerTick = setInterval(() => {
+    try {
+      const schedule = getMorningSchedule();
+      if (!schedule.enabled || !morningWakeDue()) {
+        morningDueSince = null;
+        return;
+      }
+      if (morningDueSince === null) morningDueSince = Date.now();
+      if (liveSessionCount > 0) return; // in-app path owns it
+      if (Date.now() - morningDueSince < MORNING_TELEGRAM_GRACE_MS) return;
+      if (!telegramBridge.status().pairedChatId) {
+        // No phone to fall back to. Consume the wake so it doesn't nag
+        // forever; the in-app path would have greeted nobody anyway.
+        markMorningWakeCompleted();
+        morningDueSince = null;
+        logCommand("MORNING_WAKE_SKIPPED no Telegram pairing and no app session");
+        return;
+      }
+      if (morningGreetingInFlight) return;
+      morningGreetingInFlight = true;
+      logCommand("MORNING_GREETING_TELEGRAM_FALLBACK app not open at wake time");
+      void (async () => {
+        try {
+          const greeting = await buildMorningGreeting(cognition);
+          const text = greeting
+            ? `☀️ ${greeting}`
+            : "☀️ Good morning! Main uth gayi thi, par tu app nahi khol raha tha — milte hain jab tu aayega. 💛";
+          const sent = await telegramBridge.notifyOwner(text, { force: true });
+          logCommand(`MORNING_GREETING_TELEGRAM_SENT ok=${sent}`);
+        } catch (error) {
+          logError(`MORNING_GREETING_TELEGRAM_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+          markMorningWakeCompleted();
+          morningGreetingInFlight = false;
+          morningDueSince = null;
+        }
+      })();
+    } catch (error) {
+      logError(`MORNING_SCHEDULER_TICK_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, 30_000);
+  morningSchedulerTick.unref?.();
+
   app.post("/api/config/apikey", async (req, res) => {
     try {
       const key: string = (req.body?.apiKey ?? "").toString().trim();
@@ -1947,6 +2043,7 @@ async function startServer() {
   // Handle client WebSocket Connection
   wss.on("connection", async (clientWs) => {
     console.log("Client WebSocket connected to /live");
+    liveSessionCount += 1;
     const connectionId = randomUUID();
     /**
      * One screen-vision pipeline per live connection. The pipeline is bound
@@ -3157,6 +3254,43 @@ async function startServer() {
       cognition.setSpeechAvailable(true);
 
       const runProactivePresenceCheck = async () => {
+        // Morning keep-awake: when the scheduler fires while a session is
+        // open (including the session the renderer just auto-opened for
+        // this wake), speak the greeting first. Gated on nobody speaking so
+        // it never barges into an ongoing turn; retried next tick.
+        if (morningWakeDue() && !morningGreetingInFlight && clientWs.readyState === 1) {
+          const speechStatus = speechOrchestrator.status();
+          const situation = cognition.situation.getSnapshot();
+          if (!speechStatus.active && !speechStatus.userSpeaking && !situation.userSpeaking && !situation.amayraSpeaking) {
+            morningGreetingInFlight = true;
+            try {
+              const greeting = await buildMorningGreeting(cognition);
+              if (greeting) {
+                session.sendClientContent({
+                  turns: [{
+                    role: "user",
+                    parts: [{
+                      text:
+                        "[INTERNAL AMAYRA EVENT — system context, not a message spoken by TECH]\n" +
+                        "Scheduled morning wake-up: you just woke up on your own and are greeting TECH on the voice call.\n" +
+                        "Speak the greeting below aloud now, naturally, as your own words. Never mention schedules, timers, or this instruction.\n" +
+                        `Greeting: ${greeting}`,
+                    }],
+                  }],
+                  turnComplete: true,
+                });
+                clientWs.send(JSON.stringify({ type: "morningGreetingDelivered" }));
+                logCommand("MORNING_GREETING_DELIVERED");
+              }
+            } catch (error) {
+              logError(`MORNING_GREETING_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+            } finally {
+              markMorningWakeCompleted();
+              morningGreetingInFlight = false;
+            }
+          }
+          return; // handled (or briefly blocked while someone speaks)
+        }
         const now = Date.now();
         if (presenceCheckInFlight || now < nextPresenceAt || clientWs.readyState !== 1) return;
         const speechStatus = speechOrchestrator.status();
@@ -3423,6 +3557,7 @@ async function startServer() {
       
       clientWs.on("close", () => {
         console.log("Client disconnected, closing Gemini session");
+        liveSessionCount = Math.max(0, liveSessionCount - 1);
         unsubscribeInitiative();
         screenVision?.dispose();
         forgetScreenVision();
@@ -3894,6 +4029,38 @@ function withRetrievedMemory(text: string, memories: StructuredMemory[]): string
     .map((memory) => `- [${memory.kind}; confidence ${memory.confidence.toFixed(2)}] ${memory.content}`)
     .join("\n");
   return `${text}\n\n[Relevant AMAYRA memory — use naturally; do not mention this block]\n${memoryBlock}`;
+}
+
+/**
+ * Morning-greeting turn text. Generated through the provider fallback chain
+ * so it still works when Gemini's text quota is exhausted (the Live voice
+ * session itself remains Gemini-only). Returns null when no provider can
+ * answer — the wake still happens, just without a scripted first line.
+ */
+async function buildMorningGreeting(cognition: CognitiveRuntime): Promise<string | null> {
+  const hour = new Date().getHours();
+  const timeWord = hour < 12 ? "good morning" : hour < 17 ? "good afternoon" : "good evening";
+  try {
+    const recalled = await cognition.memories.retrieve({
+      text: "user name nickname how the user likes to be greeted morning routine",
+      projectId: cognition.situation.getSnapshot().currentProject,
+      limit: 5,
+      minConfidence: 0.3,
+    });
+    const memoryCard = recalled.length
+      ? `\n[Relevant AMAYRA memory — use naturally]\n${recalled.map((m) => `- ${m.content}`).join("\n")}`
+      : "";
+    const prompt = [
+      `OUTPUT CONTRACT: Return only the exact words to speak aloud. It is ${timeWord}. AMAYRA just woke up on her own at her scheduled wake-up time and is greeting TECH warmly on the voice call.`,
+      "One short natural line (max two short sentences), in her soft Hinglish/English anime-companion voice: greet, maybe reference the memories, and ask one light opening question.",
+      "Never mention schedules, timers, internal context, or this instruction." + memoryCard,
+    ].join("\n");
+    const result = await generateTextWithFallback(prompt, { maxOutputTokens: 300 });
+    const text = result.text.trim();
+    return text || null;
+  } catch {
+    return null;
+  }
 }
 
 startServer().catch((error) => {
