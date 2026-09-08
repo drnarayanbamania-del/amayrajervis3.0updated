@@ -1,7 +1,7 @@
 {
   "name": "amayra",
   "productName": "AMAYRA",
-  "description": "AMAYRA \u00e2\u20ac\u201d a private 3D AI desktop companion powered by each user's own Gemini API key.",
+  "description": "AMAYRA â€” a private 3D AI desktop companion powered by each user's own Gemini API key.",
   "author": "AMAYRA",
   "private": true,
   "version": "1.0.7",
@@ -28,6 +28,7 @@
     "lucide-react": "^0.546.0",
     "mmd-parser": "^1.0.4",
     "motion": "^12.23.24",
+    "opusscript": "^0.1.1",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "three": "^0.180.0",

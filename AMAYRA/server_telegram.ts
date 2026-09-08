@@ -25,6 +25,8 @@ import {
 } from "./server_providers";
 import fs from "fs";
 import { randomUUID } from "node:crypto";
+import { synthesizeVoiceNote, readOpusDurationSeconds } from "./server_voiceNote";
+import { getGeminiApiKey } from "./server_paths";
 
 const TG_API = "https://api.telegram.org";
 const TEXT_MODEL = "gemini-3.5-flash";
@@ -71,6 +73,8 @@ interface TelegramConfig {
   pairedChatId?: number;
   pairedName?: string;
   pairedAt?: string;
+  /** When true, conversational replies go out as voice notes (with text fallback). */
+  voiceReplies?: boolean;
 }
 
 interface TelegramMessage {
@@ -526,6 +530,7 @@ export class TelegramBridge {
       "📜 Commands:",
       "/status — core + agent health",
       "/screenshot — grab the PC screen",
+      "/voice — toggle voice-note replies (her real voice)",
       "/confirm <id> — approve a pending risky action",
       "/forget — unpair this chat",
       "",
@@ -573,6 +578,18 @@ export class TelegramBridge {
         } else {
           await this.reply(chatId, `⚠️ Screenshot failed: ${outcome.error ?? "no image returned"}`);
         }
+        return;
+      }
+      case "/voice": {
+        const next = !this.config.voiceReplies;
+        this.config.voiceReplies = next;
+        this.saveConfig();
+        await this.reply(
+          chatId,
+          next
+            ? "🎙️ Voice replies ON — ab main apni awaaz mein voice notes bhejungi. (Agar voice banane mein dikkat ho to normal text bhejungi.)"
+            : "💬 Voice replies OFF — text messages wapas.",
+        );
         return;
       }
       case "/forget":
@@ -678,7 +695,9 @@ export class TelegramBridge {
       await this.sendPhoto(msg.chat.id, pendingScreenshot).catch(() => undefined);
     }
     finalText = (finalText || "Done.").trim();
-    await this.reply(msg.chat.id, finalText);
+    if (!(await this.trySendVoiceNote(msg.chat.id, finalText))) {
+      await this.reply(msg.chat.id, finalText);
+    }
 
     history.push({ role: "user", text });
     history.push({ role: "model", text: finalText });
@@ -704,6 +723,43 @@ export class TelegramBridge {
   private async reply(chatId: number, text: string): Promise<void> {
     for (const chunk of chunkText(text)) {
       await this.apiCall("sendMessage", { chat_id: chatId, text: chunk });
+    }
+  }
+
+  /**
+   * Try to reply with a voice note in AMAYRA's own voice. Returns false when
+   * voice replies are off, no Gemini key exists, or TTS/encoding failed —
+   * the caller then falls back to a plain text reply.
+   */
+  private async trySendVoiceNote(chatId: number, text: string): Promise<boolean> {
+    if (this.config.voiceReplies !== true) return false;
+    const apiKey = getGeminiApiKey();
+    if (!apiKey) return false;
+    try {
+      const ogg = await synthesizeVoiceNote(apiKey, text);
+      if (!ogg) return false;
+      await this.sendVoice(chatId, ogg, readOpusDurationSeconds(ogg));
+      this.options.logCommand(`TELEGRAM_VOICE_SENT chat=${chatId} bytes=${ogg.length}`);
+      return true;
+    } catch (error) {
+      this.options.logError(`TELEGRAM_VOICE_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
+  private async sendVoice(chatId: number, oggOpus: Buffer, durationSeconds?: number): Promise<void> {
+    const token = this.config.botToken;
+    if (!token) throw new Error("Bot token is not configured.");
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    form.append("voice", new Blob([new Uint8Array(oggOpus)], { type: "audio/ogg" }), "amayra.ogg");
+    if (durationSeconds && durationSeconds > 0) {
+      form.append("duration", String(Math.max(1, Math.round(durationSeconds))));
+    }
+    const res = await fetch(`${TG_API}/bot${token}/sendVoice`, { method: "POST", body: form });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`Telegram sendVoice failed (${res.status}): ${detail.slice(0, 160)}`);
     }
   }
 
