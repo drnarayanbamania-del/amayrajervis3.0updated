@@ -1,7 +1,8 @@
 import fs from "fs/promises";
-import { GoogleGenAI, Type } from "@google/genai";
+import { Type } from "@google/genai";
 import { Memory, MemoryTransaction } from "./src/lib/memoryTypes";
 import { dataFile } from "./server_paths";
+import { generateTextWithFallback } from "./server_providers";
 
 const MEMORY_FILE = dataFile("memories.json");
 
@@ -78,7 +79,6 @@ let isConsolidating = false;
 let consolidationBackoffUntil = 0;
 
 export async function processConversationSlice(
-  apiKey: string,
   dialogueHistory: { role: string; text: string }[]
 ): Promise<Memory[] | null> {
   if (isConsolidating) {
@@ -98,14 +98,9 @@ export async function processConversationSlice(
   console.log("[Memory] Initiating pipeline for dialogue slice of length:", dialogueHistory.length);
 
   try {
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build",
-        }
-      }
-    });
+    // Memory consolidation rides the provider fallback chain so a Gemini
+    // quota exhaustion no longer freezes AMAYRA's long-term memory for the
+    // whole day — Groq/DeepSeek/OpenAI take the slice instead.
 
     const currentMemories = await loadMemories();
     
@@ -133,48 +128,14 @@ ${dialogueContext}
 - TEXT STYLE: Express the memories as clean, concise, third-person declarative summaries (e.g., 'The user is building a startup named Amayra.', 'The user loves playing GTA 6.', 'The user enjoys technical and fast-paced styling explanations.'). Do not include conversational filler, quotes, or timestamps.
 - ID: For ADD, leave blank. For UPDATE or REMOVE, provide the exact 'id' from the "Current user memories" list.`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            transactions: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  action: {
-                    type: Type.STRING,
-                    description: "ADD, UPDATE, or REMOVE transaction.",
-                    enum: ["ADD", "UPDATE", "REMOVE"]
-                  },
-                  id: {
-                    type: Type.STRING,
-                    description: "Specific ID of the existing memory being modified or deleted (leave blank/null for ADD)."
-                  },
-                  category: {
-                    type: Type.STRING,
-                    description: "The Memory category classification.",
-                    enum: ["identity", "preference", "goal", "project", "relationship", "emotional", "behavior"]
-                  },
-                  text: {
-                    type: Type.STRING,
-                    description: "The memory summarized as a concise declarative statement in third-person."
-                  }
-                },
-                required: ["action", "category", "text"]
-              }
-            }
-          },
-          required: ["transactions"]
-        }
-      }
+    const responseText = await generateTextWithFallback(prompt, {
+      systemInstruction:
+        "You output only strict JSON matching the requested schema. No markdown, no commentary.",
+      jsonMode: true,
+      temperature: 0.2,
     });
 
-    const resultText = response.text?.trim() || "{}";
+    const resultText = responseText.text?.trim() || "{}";
     const resultObj = JSON.parse(resultText);
     const transactions: MemoryTransaction[] = resultObj.transactions || [];
 

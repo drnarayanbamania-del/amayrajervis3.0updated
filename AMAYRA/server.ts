@@ -25,6 +25,18 @@ import {
   clearGeminiApiKey,
 } from "./server_paths";
 import {
+  type ProviderId,
+  PROVIDER_IDS,
+  PROVIDER_LABELS,
+  checkProviderKey,
+  clearProviderKey,
+  describeProviderStatus,
+  generateTextWithFallback,
+  hasAnyProviderKey,
+  setProviderKey,
+  setProviderLogger,
+} from "./server_providers";
+import {
   CognitiveRuntime,
   DesktopPerception,
   GoalPlanner,
@@ -98,6 +110,9 @@ function appendLog(fileName: string, message: string): void {
 const logCommand = (m: string) => appendLog("commands.log", m);
 const logStartup = (m: string) => appendLog("startup.log", m);
 const logError = (m: string) => appendLog("errors.log", m);
+
+// Provider fallback logging flows into the same per-user log files.
+setProviderLogger({ command: logCommand, error: logError });
 
 // ---------------------------------------------------------------------------
 // Core error protocol — single funnel for faults. Process guards are installed
@@ -835,12 +850,12 @@ async function startServer() {
     provider: {
       generate: async ({ model, prompt, signal }) => {
         if (signal?.aborted) throw new Error("Model call cancelled.");
-        const key = getGeminiApiKey();
-        if (!key) throw new Error("No Gemini API key is configured.");
-        const modelClient = new GoogleGenAI({ apiKey: key });
-        const response = await modelClient.models.generateContent({ model, contents: prompt });
-        if (signal?.aborted) throw new Error("Model call cancelled.");
-        return response.text || "";
+        // Routed through the provider fallback chain (Gemini → Groq →
+        // DeepSeek → OpenAI); the requested model name is kept in the
+        // model_history entry for reference.
+        void model;
+        const result = await generateTextWithFallback(prompt, { signal });
+        return result.text;
       },
     },
     maxCallsPerMinute: 20,
@@ -871,7 +886,6 @@ async function startServer() {
   // ---------------------------------------------------------------------------
   const telegramBridge = new TelegramBridge({
     configPath: dataFile("telegram.json"),
-    getApiKey: () => getGeminiApiKey(),
     retrieveMemories: async (text) => {
       const recalled = await cognition.memories.retrieve({
         text,
@@ -928,8 +942,6 @@ async function startServer() {
       const now = Date.now();
       if (!isCritical && now - lastTelegramAlertAttemptAt < 120_000) return;
       lastTelegramAlertAttemptAt = now;
-      const apiKey = getGeminiApiKey();
-      if (!apiKey) return;
       const meta = outcome.event.metadata ?? {};
       const observation = [
         typeof meta.thought === "string" ? meta.thought : "",
@@ -937,7 +949,6 @@ async function startServer() {
         typeof meta.activeWindow === "string" ? `window: ${meta.activeWindow}` : "",
         typeof meta.message === "string" ? meta.message : "",
       ].filter(Boolean).join(" | ") || type;
-      const client = new GoogleGenAI({ apiKey });
       const prompt = [
         "You are AMAYRA, a witty AI companion running on the user's Windows PC. The user is away from the app; this reaches their Telegram chat on their phone.",
         `Private observation: ${observation}`,
@@ -945,9 +956,9 @@ async function startServer() {
         "If it is not worth it, return exactly: SKIP",
         "Otherwise write ONE short natural line (at most two short sentences) in the user's style (Hinglish or English), no prefix, no quotes, no mention of monitoring or internal context.",
       ].join("\n");
-      void client.models.generateContent({ model: "gemini-3.5-flash", contents: prompt })
-        .then((response) => {
-          const text = (response.text ?? "").trim();
+      void generateTextWithFallback(prompt)
+        .then((result) => {
+          const text = result.text.trim();
           if (!text || /^SKIP$/i.test(text)) return;
           return telegramBridge.notifyOwner(`🔔 ${text}`);
         })
@@ -1329,7 +1340,7 @@ async function startServer() {
   // GET reports only whether a key exists — the key itself is never returned.
   // ---------------------------------------------------------------------------
   app.get("/api/config", (_req, res) => {
-    res.json({ hasApiKey: hasGeminiApiKey() });
+    res.json({ hasApiKey: hasAnyProviderKey() });
   });
 
   app.post("/api/config/apikey", async (req, res) => {
@@ -1369,6 +1380,49 @@ async function startServer() {
   });
 
   // ---------------------------------------------------------------------------
+  // Provider fallback keys (Gemini → Groq → DeepSeek → OpenAI). Keys are
+  // validated, then stored server-side in provider-keys.json; they are never
+  // returned to clients — only existence/cooldown status is reported.
+  // ---------------------------------------------------------------------------
+  app.get("/api/config/providers", (_req, res) => {
+    res.json({ providers: describeProviderStatus() });
+  });
+
+  app.post("/api/config/providers/:provider/key", async (req, res) => {
+    try {
+      const provider = req.params.provider as ProviderId;
+      if (!PROVIDER_IDS.includes(provider)) {
+        return res.status(400).json({ error: "Unknown provider." });
+      }
+      const key = (req.body?.apiKey ?? "").toString().trim();
+      if (!key) return res.status(400).json({ error: "API key is required." });
+      const check = await checkProviderKey(provider, key);
+      if (check.authRejected) {
+        logError(`PROVIDER_KEY_REJECTED ${provider}: ${check.message}`);
+        return res.status(400).json({
+          error: `${PROVIDER_LABELS[provider]} rejected that key. Check it and try again.`,
+        });
+      }
+      setProviderKey(provider, key);
+      logCommand(`PROVIDER_KEY_SAVED ${provider}${check.ok ? "" : " (validation soft-failed; saved anyway)"}`);
+      res.json({ ok: true, providers: describeProviderStatus() });
+    } catch (e: any) {
+      logError(`PROVIDER_KEY_SAVE_ERROR: ${e?.message || e}`);
+      res.status(500).json({ error: e?.message || "Failed to save API key." });
+    }
+  });
+
+  app.delete("/api/config/providers/:provider/key", (req, res) => {
+    const provider = req.params.provider as ProviderId;
+    if (!PROVIDER_IDS.includes(provider)) {
+      return res.status(400).json({ error: "Unknown provider." });
+    }
+    clearProviderKey(provider);
+    logCommand(`PROVIDER_KEY_CLEARED ${provider}`);
+    res.json({ ok: true, providers: describeProviderStatus() });
+  });
+
+  // ---------------------------------------------------------------------------
   // Phone-companion contract (SAKEERA AI v2.11 / MAYA Agentic v3.0):
   // POST /chat {prompt, conversationId} -> {response} | text/event-stream.
   // Lets the MAYA phone app use AMAYRA's brain over the LAN.
@@ -1376,8 +1430,9 @@ async function startServer() {
   app.post("/chat", async (req, res) => {
     const prompt = (req.body?.prompt ?? "").toString().trim();
     if (!prompt) return res.status(400).json({ error: "prompt is required." });
-    const apiKey = getGeminiApiKey();
-    if (!apiKey) return res.status(503).json({ error: "No Gemini API key configured on the host." });
+    if (!hasAnyProviderKey()) {
+      return res.status(503).json({ error: "No model API key configured on the host." });
+    }
     try {
       const recalled = await cognition.memories.retrieve({
         text: prompt,
@@ -1388,16 +1443,14 @@ async function startServer() {
       const memoryCard = recalled.length
         ? "\nRelevant memories: " + recalled.map((m) => m.content.slice(0, 100)).join(" | ")
         : "";
-      const client = new GoogleGenAI({ apiKey });
-      const result = await client.models.generateContent({
-        model: "gemini-3.5-flash",
-        contents:
-          "You are AMAYRA, the user's warm, witty AI companion on their PC, replying to their phone. " +
+      const result = await generateTextWithFallback(
+        "You are AMAYRA, the user's warm, witty AI companion on their PC, replying to their phone. " +
           "Match the user's language (Hinglish/Hindi/English). Keep it chat-short (1-4 sentences)." +
           memoryCard +
           "\nUser: " + prompt,
-      });
-      const response = (result.text ?? "").trim();
+        { maxOutputTokens: 400 },
+      );
+      const response = result.text.trim();
       if (!response) return res.status(502).json({ error: "Model returned an empty response." });
       logCommand(`PHONE_CHAT len=${prompt.length} reply=${response.length}`);
       if (String(req.headers.accept || "").includes("text/event-stream")) {
@@ -2719,7 +2772,7 @@ async function startServer() {
                 lastConsolidatedIndex = dialogueHistory.length;
                 (async () => {
                   try {
-                    const updated = await processConversationSlice(apiKey, unconsolidated);
+                    const updated = await processConversationSlice(unconsolidated);
                     if (updated) {
                       await cognition.memories.importLegacy(updated);
                       console.log("[Memory Sync] Sending refreshed memory list to client.");

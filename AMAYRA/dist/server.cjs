@@ -28,7 +28,7 @@ var import_path2 = __toESM(require("path"), 1);
 var import_ws = require("ws");
 var import_genai3 = require("@google/genai");
 var import_dotenv = __toESM(require("dotenv"), 1);
-var fs10 = __toESM(require("fs"), 1);
+var fs11 = __toESM(require("fs"), 1);
 var import_node_crypto11 = require("node:crypto");
 var import_promises8 = __toESM(require("node:dns/promises"), 1);
 var import_node_net2 = __toESM(require("node:net"), 1);
@@ -36,7 +36,6 @@ var import_node_child_process = require("node:child_process");
 
 // server_memory.ts
 var import_promises = __toESM(require("fs/promises"), 1);
-var import_genai = require("@google/genai");
 
 // server_paths.ts
 var import_fs = __toESM(require("fs"), 1);
@@ -66,9 +65,6 @@ function getGeminiApiKey() {
   const env = process.env.GEMINI_API_KEY?.trim();
   return env || void 0;
 }
-function hasGeminiApiKey() {
-  return Boolean(getGeminiApiKey());
-}
 function setGeminiApiKey(key) {
   const trimmed = (key || "").trim();
   if (!trimmed) throw new Error("API key must not be empty.");
@@ -89,6 +85,420 @@ function clearGeminiApiKey() {
     import_fs.default.writeFileSync(SECRETS_FILE, JSON.stringify(current, null, 2), "utf-8");
   } catch {
   }
+}
+
+// server_providers.ts
+var import_fs2 = __toESM(require("fs"), 1);
+var import_genai = require("@google/genai");
+var PROVIDER_IDS = ["gemini", "groq", "deepseek", "openai"];
+var FALLBACK_ORDER = ["gemini", "groq", "deepseek", "openai"];
+var PROVIDER_LABELS = {
+  gemini: "Google Gemini",
+  groq: "Groq",
+  deepseek: "DeepSeek",
+  openai: "OpenAI"
+};
+var PROVIDER_BASE_URLS = {
+  groq: "https://api.groq.com/openai/v1",
+  deepseek: "https://api.deepseek.com/v1",
+  openai: "https://api.openai.com/v1"
+};
+function modelFor(id) {
+  switch (id) {
+    case "gemini":
+      return process.env.AMAYRA_GEMINI_MODEL || "gemini-3.5-flash";
+    case "groq":
+      return process.env.AMAYRA_GROQ_MODEL || "llama-3.3-70b-versatile";
+    case "deepseek":
+      return process.env.AMAYRA_DEEPSEEK_MODEL || "deepseek-chat";
+    case "openai":
+      return process.env.AMAYRA_OPENAI_MODEL || "gpt-4o-mini";
+  }
+}
+var PROVIDER_COOLDOWN_MS = 60 * 60 * 1e3;
+var KEYS_FILE = dataFile("provider-keys.json");
+function readKeyFile() {
+  try {
+    if (import_fs2.default.existsSync(KEYS_FILE)) {
+      return JSON.parse(import_fs2.default.readFileSync(KEYS_FILE, "utf-8"));
+    }
+  } catch {
+  }
+  return {};
+}
+function writeKeyFile(next) {
+  import_fs2.default.writeFileSync(KEYS_FILE, JSON.stringify(next, null, 2), "utf-8");
+  try {
+    import_fs2.default.chmodSync(KEYS_FILE, 384);
+  } catch {
+  }
+}
+function getProviderKeys() {
+  const file = readKeyFile();
+  return {
+    gemini: file.gemini?.trim() || getGeminiApiKey(),
+    groq: file.groq?.trim() || void 0,
+    deepseek: file.deepseek?.trim() || void 0,
+    openai: file.openai?.trim() || void 0
+  };
+}
+function hasProviderKey(id) {
+  return Boolean(getProviderKeys()[id]);
+}
+function hasAnyProviderKey() {
+  return PROVIDER_IDS.some((id) => hasProviderKey(id));
+}
+function setProviderKey(id, key) {
+  const trimmed = (key || "").trim();
+  if (!trimmed) throw new Error("API key must not be empty.");
+  const current = readKeyFile();
+  current[id] = trimmed;
+  writeKeyFile(current);
+}
+function clearProviderKey(id) {
+  const current = readKeyFile();
+  delete current[id];
+  writeKeyFile(current);
+}
+var cooldownUntil = /* @__PURE__ */ new Map();
+function markProviderExhausted(id, reason) {
+  cooldownUntil.set(id, Date.now() + PROVIDER_COOLDOWN_MS);
+  log("error", `PROVIDER_COOLDOWN ${id} for ${PROVIDER_COOLDOWN_MS / 6e4}m: ${reason}`);
+}
+function markProviderOk(id) {
+  if (cooldownUntil.delete(id)) log("command", `PROVIDER_RECOVERED ${id}`);
+}
+function providerCooldownRemainingMs(id) {
+  const until = cooldownUntil.get(id) ?? 0;
+  return Math.max(0, until - Date.now());
+}
+function isProviderAvailable(id) {
+  return hasProviderKey(id) && providerCooldownRemainingMs(id) === 0;
+}
+function availableProviderOrder() {
+  return FALLBACK_ORDER.filter(isProviderAvailable);
+}
+var logCommand = (line) => console.log(`[Providers] ${line}`);
+var logError = (line) => console.error(`[Providers] ${line}`);
+function setProviderLogger(handlers) {
+  logCommand = handlers.command;
+  logError = handlers.error;
+}
+function log(kind, line) {
+  (kind === "command" ? logCommand : logError)(line);
+}
+function isQuotaError(message) {
+  return /\b429\b|RESOURCE_EXHAUSTED|rate.?limit|quota|exceeded/i.test(message);
+}
+function isAuthError(message) {
+  return /\b401\b|\b403\b|UNAUTHENTICATED|PERMISSION_DENIED|invalid[_ ]?api[_ ]?key|authentication/i.test(message);
+}
+async function generateOnGemini(prompt, options) {
+  const key = getProviderKeys().gemini;
+  if (!key) throw new Error("No Gemini API key configured.");
+  const client = new import_genai.GoogleGenAI({ apiKey: key });
+  const response = await client.models.generateContent({
+    model: modelFor("gemini"),
+    contents: prompt,
+    config: {
+      ...options.systemInstruction ? { systemInstruction: options.systemInstruction } : {},
+      ...options.jsonMode ? { responseMimeType: "application/json" } : {},
+      ...options.temperature !== void 0 ? { temperature: options.temperature } : {},
+      ...options.maxOutputTokens !== void 0 ? { maxOutputTokens: options.maxOutputTokens } : {}
+    }
+  });
+  return (response.text ?? "").trim();
+}
+async function generateOnOpenAiCompatible(id, prompt, options) {
+  const key = getProviderKeys()[id];
+  if (!key) throw new Error(`No ${PROVIDER_LABELS[id]} API key configured.`);
+  const messages = [];
+  if (options.systemInstruction) messages.push({ role: "system", content: options.systemInstruction });
+  messages.push({ role: "user", content: prompt });
+  const response = await fetch(`${PROVIDER_BASE_URLS[id]}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${key}`
+    },
+    body: JSON.stringify({
+      model: modelFor(id),
+      messages,
+      ...options.jsonMode ? { response_format: { type: "json_object" } } : {},
+      ...options.temperature !== void 0 ? { temperature: options.temperature } : {},
+      ...options.maxOutputTokens !== void 0 ? { max_tokens: options.maxOutputTokens } : {}
+    }),
+    signal: options.signal
+  });
+  if (!response.ok) {
+    const detail = (await response.text().catch(() => "")).slice(0, 400);
+    throw new Error(`${PROVIDER_LABELS[id]} HTTP ${response.status}: ${detail || "(no body)"}`);
+  }
+  const data = await response.json();
+  return (data.choices?.[0]?.message?.content ?? "").trim();
+}
+async function generateOnProvider(id, prompt, options) {
+  if (id === "gemini") return generateOnGemini(prompt, options);
+  return generateOnOpenAiCompatible(id, prompt, options);
+}
+async function generateTextWithFallback(prompt, options = {}) {
+  const order = availableProviderOrder();
+  if (!order.length) {
+    throw new Error(
+      "No model API key is available. Add a Gemini, Groq, DeepSeek or OpenAI key in AMAYRA's API Keys settings."
+    );
+  }
+  let lastError = "";
+  for (let i = 0; i < order.length; i += 1) {
+    const id = order[i];
+    if (options.signal?.aborted) throw new Error("Model call cancelled.");
+    try {
+      const text = await generateOnProvider(id, prompt, options);
+      if (!text) throw new Error("Model returned an empty response.");
+      markProviderOk(id);
+      if (i > 0) log("command", `PROVIDER_FALLBACK_USED ${order[0]}\u2192${id}`);
+      log("command", `MODEL_VIA ${id} model=${modelFor(id)} chars=${text.length}`);
+      return { text, provider: id, model: modelFor(id) };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      if (options.signal?.aborted) throw new Error("Model call cancelled.");
+      const next = order[i + 1];
+      if (isQuotaError(lastError) || isAuthError(lastError)) {
+        markProviderExhausted(id, lastError.slice(0, 200));
+      } else {
+        log("error", `PROVIDER_FAILED ${id}: ${lastError.slice(0, 200)}`);
+      }
+      if (next) log("error", `PROVIDER_FALLBACK ${id}\u2192${next}`);
+    }
+  }
+  throw new Error(`All model providers failed. Last error: ${lastError}`);
+}
+async function checkProviderKey(id, key) {
+  const trimmed = (key || "").trim();
+  if (!trimmed) return { ok: false, authRejected: false, message: "API key is required." };
+  try {
+    if (id === "gemini") {
+      const client = new import_genai.GoogleGenAI({ apiKey: trimmed });
+      const pager = await client.models.list();
+      await pager[Symbol.asyncIterator]().next();
+    } else {
+      const response = await fetch(`${PROVIDER_BASE_URLS[id]}/models`, {
+        headers: { Authorization: `Bearer ${trimmed}` },
+        signal: AbortSignal.timeout(15e3)
+      });
+      if (!response.ok) {
+        const detail = (await response.text().catch(() => "")).slice(0, 200);
+        const authRejected = response.status === 401 || response.status === 403;
+        return {
+          ok: false,
+          authRejected,
+          message: `${PROVIDER_LABELS[id]} rejected the key (HTTP ${response.status}): ${detail || "no details"}`
+        };
+      }
+    }
+    return { ok: true, authRejected: false, message: "Key validated." };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, authRejected: isAuthError(message), message };
+  }
+}
+function describeProviderStatus() {
+  return FALLBACK_ORDER.map((id) => ({
+    id,
+    label: PROVIDER_LABELS[id],
+    model: modelFor(id),
+    hasKey: hasProviderKey(id),
+    available: isProviderAvailable(id),
+    cooldownRemainingMs: providerCooldownRemainingMs(id)
+  }));
+}
+function normalizeSchema(value) {
+  if (Array.isArray(value)) return value.map(normalizeSchema);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [key, item] of Object.entries(value)) {
+      out[key] = key === "type" && typeof item === "string" ? item.toLowerCase() : normalizeSchema(item);
+    }
+    return out;
+  }
+  return value;
+}
+function toolProtocolInstruction(tools) {
+  const catalogue = JSON.stringify(
+    tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      parameters: normalizeSchema(tool.parameters ?? {})
+    }))
+  );
+  return [
+    "# Tool protocol",
+    "You can use tools. Available tools:",
+    catalogue,
+    "To call tools, reply with ONLY this JSON (no prose, no markdown):",
+    '{"function_calls":[{"name":"tool_name","args":{ ... }}]}',
+    "Tool results arrive as a user message containing JSON under tool_results.",
+    "When you are ready to answer (or need no tools), reply with ONLY:",
+    '{"text":"your answer"}',
+    "Never output anything except one of those two JSON objects."
+  ].join("\n");
+}
+function translateContentsToMessages(contents, systemInstruction) {
+  const messages = [
+    { role: "system", content: systemInstruction }
+  ];
+  for (const entry of contents) {
+    for (const part of entry.parts) {
+      if ("text" in part && typeof part.text === "string") {
+        messages.push({ role: entry.role === "model" ? "assistant" : "user", content: part.text });
+      } else if ("functionCall" in part && part.functionCall) {
+        messages.push({
+          role: "assistant",
+          content: JSON.stringify({ function_calls: [{ name: part.functionCall.name, args: part.functionCall.args ?? {} }] })
+        });
+      } else if ("functionResponse" in part && part.functionResponse) {
+        messages.push({
+          role: "user",
+          content: JSON.stringify({ tool_results: [{ name: part.functionResponse.name, result: part.functionResponse.response }] })
+        });
+      }
+    }
+  }
+  return messages;
+}
+function parseToolProtocolReply(raw, validTools) {
+  let text = raw.trim();
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) text = fence[1].trim();
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end <= start) throw new Error("Tool protocol: model reply was not JSON.");
+  const parsed = JSON.parse(text.slice(start, end + 1));
+  if (Array.isArray(parsed.function_calls)) {
+    const functionCalls = parsed.function_calls.filter((call) => typeof call?.name === "string" && validTools.has(call.name)).map((call) => ({
+      name: call.name,
+      args: call.args && typeof call.args === "object" ? call.args : {}
+    }));
+    if (functionCalls.length) return { text: null, functionCalls };
+  }
+  return { text: typeof parsed.text === "string" ? parsed.text : null, functionCalls: [] };
+}
+async function generateTurnOnProvider(id, contents, systemInstruction, tools) {
+  if (id === "gemini") {
+    const key = getProviderKeys().gemini;
+    if (!key) throw new Error("No Gemini API key configured.");
+    const client = new import_genai.GoogleGenAI({ apiKey: key });
+    const response = await client.models.generateContent({
+      model: modelFor("gemini"),
+      contents,
+      config: {
+        systemInstruction,
+        tools: [{ functionDeclarations: tools }]
+      }
+    });
+    const calls = (response.functionCalls ?? []).map((call) => ({
+      name: call.name ?? "",
+      args: call.args ?? {}
+    }));
+    return { text: response.text ?? null, functionCalls: calls.filter((call) => call.name) };
+  }
+  const validTools = new Set(tools.map((tool) => tool.name));
+  const baseMessages = translateContentsToMessages(
+    contents,
+    `${systemInstruction}
+
+${toolProtocolInstruction(tools)}`
+  );
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const messages = [...baseMessages];
+    if (attempt > 0) {
+      messages.push({
+        role: "user",
+        content: 'Your previous reply was not valid protocol JSON. Answer again with ONLY {"text":"..."} or {"function_calls":[...]}.'
+      });
+    }
+    const raw = await generateChatMessages(id, messages, { jsonMode: true, temperature: 0.6 });
+    return parseToolProtocolReply(raw, validTools);
+  }
+  throw new Error("Tool protocol: no valid reply after retry.");
+}
+async function generateChatMessages(id, messages, options) {
+  const key = getProviderKeys()[id];
+  if (!key) throw new Error(`No ${PROVIDER_LABELS[id]} API key configured.`);
+  const response = await fetch(`${PROVIDER_BASE_URLS[id]}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+    body: JSON.stringify({
+      model: modelFor(id),
+      messages,
+      ...options.jsonMode ? { response_format: { type: "json_object" } } : {},
+      ...options.temperature !== void 0 ? { temperature: options.temperature } : {},
+      ...options.maxOutputTokens !== void 0 ? { max_tokens: options.maxOutputTokens } : {}
+    }),
+    signal: options.signal
+  });
+  if (!response.ok) {
+    const detail = (await response.text().catch(() => "")).slice(0, 400);
+    throw new Error(`${PROVIDER_LABELS[id]} HTTP ${response.status}: ${detail || "(no body)"}`);
+  }
+  const data = await response.json();
+  return (data.choices?.[0]?.message?.content ?? "").trim();
+}
+async function generateTurnWithToolsFallback(options) {
+  const order = availableProviderOrder();
+  if (!order.length) {
+    throw new Error(
+      "No model API key is available. Add a Gemini, Groq, DeepSeek or OpenAI key in AMAYRA's API Keys settings."
+    );
+  }
+  let lastError = "";
+  for (let i = 0; i < order.length; i += 1) {
+    const id = order[i];
+    if (options.signal?.aborted) throw new Error("Model call cancelled.");
+    try {
+      if (id === "gemini") {
+        const turn2 = await generateTurnOnProvider("gemini", options.contents, options.systemInstruction, options.tools);
+        markProviderOk(id);
+        log("command", `MODEL_TURN_VIA gemini calls=${turn2.functionCalls.length}`);
+        return { ...turn2, provider: id };
+      }
+      const validTools = new Set(options.tools.map((tool) => tool.name));
+      const baseMessages = translateContentsToMessages(
+        options.contents,
+        `${options.systemInstruction}
+
+${toolProtocolInstruction(options.tools)}`
+      );
+      let turn = null;
+      for (let attempt = 0; attempt < 2 && !turn; attempt += 1) {
+        const messages = [...baseMessages];
+        if (attempt > 0) {
+          messages.push({
+            role: "user",
+            content: 'Your previous reply was not valid protocol JSON. Answer again with ONLY {"text":"..."} or {"function_calls":[...]}.'
+          });
+        }
+        const raw = await generateChatMessages(id, messages, { jsonMode: true, temperature: 0.6, signal: options.signal });
+        turn = parseToolProtocolReply(raw, validTools);
+      }
+      if (!turn) throw new Error("Tool protocol: no valid reply after retry.");
+      markProviderOk(id);
+      if (i > 0) log("command", `PROVIDER_FALLBACK_USED ${order[0]}\u2192${id}`);
+      log("command", `MODEL_TURN_VIA ${id} calls=${turn.functionCalls.length}`);
+      return { ...turn, provider: id };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      if (options.signal?.aborted) throw new Error("Model call cancelled.");
+      const next = order[i + 1];
+      if (isQuotaError(lastError) || isAuthError(lastError)) {
+        markProviderExhausted(id, lastError.slice(0, 200));
+      } else {
+        log("error", `PROVIDER_FAILED ${id}: ${lastError.slice(0, 200)}`);
+      }
+      if (next) log("error", `PROVIDER_FALLBACK ${id}\u2192${next}`);
+    }
+  }
+  throw new Error(`All model providers failed. Last error: ${lastError}`);
 }
 
 // server_memory.ts
@@ -144,7 +554,7 @@ function formatSystemInstructionsWithMemories(baseInstruction, memories) {
 }
 var isConsolidating = false;
 var consolidationBackoffUntil = 0;
-async function processConversationSlice(apiKey, dialogueHistory) {
+async function processConversationSlice(dialogueHistory) {
   if (isConsolidating) {
     console.log("[Memory] Consolidation loop busy, skipping slice processing");
     return null;
@@ -158,14 +568,6 @@ async function processConversationSlice(apiKey, dialogueHistory) {
   isConsolidating = true;
   console.log("[Memory] Initiating pipeline for dialogue slice of length:", dialogueHistory.length);
   try {
-    const ai = new import_genai.GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build"
-        }
-      }
-    });
     const currentMemories = await loadMemories();
     const memoryContext = currentMemories.map((m) => `ID: ${m.id} | Category: ${m.category} | Fact: ${m.text}`).join("\n");
     const dialogueContext = dialogueHistory.map((line) => `${line.role === "user" ? "User" : "Amayra"}: ${line.text}`).join("\n");
@@ -188,47 +590,12 @@ ${dialogueContext}
   - "REMOVE": If a memory was explicitly disproven or the user directly asked Amayra to forget it.
 - TEXT STYLE: Express the memories as clean, concise, third-person declarative summaries (e.g., 'The user is building a startup named Amayra.', 'The user loves playing GTA 6.', 'The user enjoys technical and fast-paced styling explanations.'). Do not include conversational filler, quotes, or timestamps.
 - ID: For ADD, leave blank. For UPDATE or REMOVE, provide the exact 'id' from the "Current user memories" list.`;
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: import_genai.Type.OBJECT,
-          properties: {
-            transactions: {
-              type: import_genai.Type.ARRAY,
-              items: {
-                type: import_genai.Type.OBJECT,
-                properties: {
-                  action: {
-                    type: import_genai.Type.STRING,
-                    description: "ADD, UPDATE, or REMOVE transaction.",
-                    enum: ["ADD", "UPDATE", "REMOVE"]
-                  },
-                  id: {
-                    type: import_genai.Type.STRING,
-                    description: "Specific ID of the existing memory being modified or deleted (leave blank/null for ADD)."
-                  },
-                  category: {
-                    type: import_genai.Type.STRING,
-                    description: "The Memory category classification.",
-                    enum: ["identity", "preference", "goal", "project", "relationship", "emotional", "behavior"]
-                  },
-                  text: {
-                    type: import_genai.Type.STRING,
-                    description: "The memory summarized as a concise declarative statement in third-person."
-                  }
-                },
-                required: ["action", "category", "text"]
-              }
-            }
-          },
-          required: ["transactions"]
-        }
-      }
+    const responseText = await generateTextWithFallback(prompt, {
+      systemInstruction: "You output only strict JSON matching the requested schema. No markdown, no commentary.",
+      jsonMode: true,
+      temperature: 0.2
     });
-    const resultText = response.text?.trim() || "{}";
+    const resultText = responseText.text?.trim() || "{}";
     const resultObj = JSON.parse(resultText);
     const transactions = resultObj.transactions || [];
     if (transactions.length === 0) {
@@ -4481,9 +4848,8 @@ function clamp12(value, min, max) {
 
 // server_telegram.ts
 var import_genai2 = require("@google/genai");
-var import_fs2 = __toESM(require("fs"), 1);
+var import_fs3 = __toESM(require("fs"), 1);
 var TG_API = "https://api.telegram.org";
-var TEXT_MODEL = "gemini-3.5-flash";
 var MAX_TOOL_ROUNDS = 4;
 var HISTORY_LIMIT = 10;
 var MIN_MESSAGE_INTERVAL_MS = 700;
@@ -4660,9 +5026,9 @@ function sleep(ms, signal2) {
 }
 function friendlyModelError(error) {
   const raw = error instanceof Error ? error.message : String(error);
-  if (/RESOURCE_EXHAUSTED|exceeded your current quota|\b429\b/i.test(raw)) {
+  if (/RESOURCE_EXHAUSTED|exceeded your current quota|\b429\b|All model providers failed/i.test(raw)) {
     return new Error(
-      "Gemini ka aaj ka free quota (20 requests) khatam ho gaya \u{1F605} Quota midnight PT pe reset hota hai \u2014 ya phir Google AI Studio me billing enable karke limit bada sakte ho."
+      "Sabhi model providers fail ho gaye \u{1F605} (Gemini quota exhausted aur Groq/DeepSeek/OpenAI par bhi issue). Thodi der baad try karo, ya AMAYRA ke API Keys settings me ek aur key add karo."
     );
   }
   return error instanceof Error ? error : new Error(raw);
@@ -4695,8 +5061,8 @@ var TelegramBridge = class {
   // ---------------------------------------------------------------- config
   readConfig() {
     try {
-      if (import_fs2.default.existsSync(this.options.configPath)) {
-        return JSON.parse(import_fs2.default.readFileSync(this.options.configPath, "utf-8"));
+      if (import_fs3.default.existsSync(this.options.configPath)) {
+        return JSON.parse(import_fs3.default.readFileSync(this.options.configPath, "utf-8"));
       }
     } catch {
     }
@@ -4704,7 +5070,7 @@ var TelegramBridge = class {
   }
   saveConfig() {
     try {
-      import_fs2.default.writeFileSync(this.options.configPath, JSON.stringify(this.config, null, 2), "utf-8");
+      import_fs3.default.writeFileSync(this.options.configPath, JSON.stringify(this.config, null, 2), "utf-8");
     } catch (error) {
       this.options.logError(`TELEGRAM_CONFIG_SAVE_FAILED: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -4958,27 +5324,22 @@ var TelegramBridge = class {
     }
     return list;
   }
-  async generateTurn(client, contents) {
+  async generateTurn(contents) {
     try {
-      return await client.models.generateContent({
-        model: TEXT_MODEL,
+      return await generateTurnWithToolsFallback({
         contents,
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          tools: [{ functionDeclarations: TELEGRAM_TOOLS }]
-        }
+        systemInstruction: SYSTEM_INSTRUCTION,
+        tools: TELEGRAM_TOOLS
       });
     } catch (error) {
       throw friendlyModelError(error);
     }
   }
   async handleConversation(msg, text) {
-    const apiKey = this.options.getApiKey();
-    if (!apiKey) {
-      await this.reply(msg.chat.id, "\u26A0\uFE0F No Gemini API key is configured on the core, so I can't think right now.");
+    if (!hasAnyProviderKey()) {
+      await this.reply(msg.chat.id, "\u26A0\uFE0F No model API key (Gemini/Groq/DeepSeek/OpenAI) is configured on the core, so I can't think right now.");
       return;
     }
-    const client = new import_genai2.GoogleGenAI({ apiKey });
     let memoryCard = "";
     try {
       const recalled = await this.options.retrieveMemories(text);
@@ -4995,20 +5356,20 @@ var TelegramBridge = class {
     let finalText = "";
     let pendingScreenshot = null;
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round += 1) {
-      const response = await this.generateTurn(client, contents);
-      const calls = response.functionCalls ?? [];
+      const response = await this.generateTurn(contents);
+      const calls = response.functionCalls;
       if (!calls.length) {
         finalText = response.text ?? "";
         break;
       }
       contents.push({
         role: "model",
-        parts: calls.map((call) => ({ functionCall: { name: call.name ?? "", args: call.args ?? {} } }))
+        parts: calls.map((call) => ({ functionCall: { name: call.name, args: call.args } }))
       });
       const responseParts = [];
       for (const call of calls) {
-        const name = call.name ?? "";
-        const args = { ...call.args ?? {} };
+        const name = call.name;
+        const args = { ...call.args };
         let outcome;
         if (name === "takeScreenshot") {
           args.include_image = true;
@@ -5104,12 +5465,12 @@ async function migrateDevelopmentCognitionData() {
   if (import_path2.default.resolve(COGNITION_DATA_DIR) === import_path2.default.resolve(DATA_DIR)) return;
   const sourceDir = import_path2.default.join(DATA_DIR, "cognition");
   const targetDir = import_path2.default.join(COGNITION_DATA_DIR, "cognition");
-  await fs10.promises.mkdir(targetDir, { recursive: true });
+  await fs11.promises.mkdir(targetDir, { recursive: true });
   for (const name of ["memories.v1.json", "goals.v1.json", "skills.v1.json", "last-session.json"]) {
     const source = import_path2.default.join(sourceDir, name);
     const target = import_path2.default.join(targetDir, name);
     try {
-      await fs10.promises.copyFile(source, target, fs10.constants.COPYFILE_EXCL);
+      await fs11.promises.copyFile(source, target, fs11.constants.COPYFILE_EXCL);
     } catch (error) {
       const code = error.code;
       if (code !== "ENOENT" && code !== "EEXIST") throw error;
@@ -5118,28 +5479,29 @@ async function migrateDevelopmentCognitionData() {
 }
 var LOGS_DIR = import_path2.default.join(DATA_DIR, "logs");
 try {
-  fs10.mkdirSync(LOGS_DIR, { recursive: true });
+  fs11.mkdirSync(LOGS_DIR, { recursive: true });
 } catch {
 }
 function appendLog(fileName, message) {
   try {
     const line = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${message}
 `;
-    fs10.appendFile(import_path2.default.join(LOGS_DIR, fileName), line, () => {
+    fs11.appendFile(import_path2.default.join(LOGS_DIR, fileName), line, () => {
     });
   } catch {
   }
 }
-var logCommand = (m) => appendLog("commands.log", m);
+var logCommand2 = (m) => appendLog("commands.log", m);
 var logStartup = (m) => appendLog("startup.log", m);
-var logError = (m) => appendLog("errors.log", m);
+var logError2 = (m) => appendLog("errors.log", m);
+setProviderLogger({ command: logCommand2, error: logError2 });
 var cognitionEventPublisher = null;
 var telegramCriticalNotifier = null;
 var errorProtocol = new ErrorProtocol({
   dataDir: COGNITION_DATA_DIR,
   publishEvent: (event) => cognitionEventPublisher?.(event),
   onCritical: (record) => {
-    logError(`CRITICAL ${record.scope}: ${record.message}`);
+    logError2(`CRITICAL ${record.scope}: ${record.message}`);
     telegramCriticalNotifier?.(`\u{1F6A8} AMAYRA core fault (${record.scope}): ${record.message}`);
   }
 });
@@ -5306,7 +5668,7 @@ function spawnDesktopAgent() {
     frozenCandidates.push(import_path2.default.join(process.cwd(), "agent_dist", "amayra-agent", "amayra-agent.exe"));
   }
   const frozenExe = frozenCandidates.find(
-    (candidate2) => Boolean(candidate2 && fs10.existsSync(candidate2))
+    (candidate2) => Boolean(candidate2 && fs11.existsSync(candidate2))
   );
   if (frozenExe) {
     try {
@@ -5323,13 +5685,13 @@ function spawnDesktopAgent() {
       console.log(`[Desktop Agent] Launched frozen agent (PID ${child.pid}).`);
       return;
     } catch (e) {
-      logError(`AGENT_SPAWN_FROZEN_FAILED: ${e?.message || e}`);
+      logError2(`AGENT_SPAWN_FROZEN_FAILED: ${e?.message || e}`);
     }
   }
   const py = findPythonRuntime();
   if (!py) {
     console.warn("[Desktop Agent] No frozen agent and no Python interpreter found; desktop control unavailable.");
-    logError("AGENT_SPAWN_NO_RUNTIME: neither AMAYRA_AGENT_EXE nor Python available");
+    logError2("AGENT_SPAWN_NO_RUNTIME: neither AMAYRA_AGENT_EXE nor Python available");
     return;
   }
   try {
@@ -5343,7 +5705,7 @@ function spawnDesktopAgent() {
     console.log(`[Desktop Agent] Auto-spawned via Python (PID ${child.pid}).`);
   } catch (e) {
     console.warn(`[Desktop Agent] Auto-spawn failed: ${e?.message || e}`);
-    logError(`AGENT_SPAWN_PYTHON_FAILED: ${e?.message || e}`);
+    logError2(`AGENT_SPAWN_PYTHON_FAILED: ${e?.message || e}`);
   }
 }
 async function isDesktopAgentAlive() {
@@ -5601,11 +5963,11 @@ async function callDesktopAgent(tool, args, outerSignal) {
   if (requiresImageCapture(tool, args)) {
     const electronCapture = await captureViaElectron(Number(args.max_dim) || 1440);
     if (electronCapture?.ok && electronCapture.result) {
-      logCommand(`SCREEN_VISION_CAPTURE backend=electron tool=${tool}`);
+      logCommand2(`SCREEN_VISION_CAPTURE backend=electron tool=${tool}`);
       return electronCapture;
     }
     if (electronCapture?.error) {
-      logError(`SCREEN_VISION_ELECTRON_CAPTURE_FAILED: ${electronCapture.error}`);
+      logError2(`SCREEN_VISION_ELECTRON_CAPTURE_FAILED: ${electronCapture.error}`);
     }
   }
   if (!desktopAgentVerified) {
@@ -5615,7 +5977,7 @@ async function callDesktopAgent(tool, args, outerSignal) {
   let timer;
   let abortFromOuter;
   try {
-    logCommand(`EXECUTE ${tool} keys=[${Object.keys(args).join(",")}]`);
+    logCommand2(`EXECUTE ${tool} keys=[${Object.keys(args).join(",")}]`);
     const controller = new AbortController();
     timer = setTimeout(() => controller.abort(), DESKTOP_AGENT_TIMEOUT);
     abortFromOuter = () => controller.abort();
@@ -5628,14 +5990,14 @@ async function callDesktopAgent(tool, args, outerSignal) {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      logError(`AGENT_HTTP_${res.status} ${tool}: ${text.substring(0, 200)}`);
+      logError2(`AGENT_HTTP_${res.status} ${tool}: ${text.substring(0, 200)}`);
       return { ok: false, error: `Desktop agent HTTP ${res.status}: ${text}` };
     }
     return await res.json();
   } catch (err) {
     desktopAgentVerified = false;
     const msg = err?.name === "AbortError" ? "Desktop agent timed out." : "Desktop agent is not running. Start it with: uvicorn desktop_agent.main:app --port 8765";
-    logError(`AGENT_UNREACHABLE ${tool}: ${msg}`);
+    logError2(`AGENT_UNREACHABLE ${tool}: ${msg}`);
     return { ok: false, error: msg };
   } finally {
     if (timer) clearTimeout(timer);
@@ -5789,12 +6151,9 @@ async function startServer() {
     provider: {
       generate: async ({ model, prompt, signal: signal2 }) => {
         if (signal2?.aborted) throw new Error("Model call cancelled.");
-        const key = getGeminiApiKey();
-        if (!key) throw new Error("No Gemini API key is configured.");
-        const modelClient = new import_genai3.GoogleGenAI({ apiKey: key });
-        const response = await modelClient.models.generateContent({ model, contents: prompt });
-        if (signal2?.aborted) throw new Error("Model call cancelled.");
-        return response.text || "";
+        void model;
+        const result2 = await generateTextWithFallback(prompt, { signal: signal2 });
+        return result2.text;
       }
     },
     maxCallsPerMinute: 20,
@@ -5806,7 +6165,7 @@ async function startServer() {
   const critic = new TaskCritic();
   const processCognitiveEvent = (event) => cognition.process(event).catch((error) => {
     const reason = error instanceof Error ? error.message : String(error);
-    logError(`COGNITION_EVENT_FAILED ${event.type}: ${reason}`);
+    logError2(`COGNITION_EVENT_FAILED ${event.type}: ${reason}`);
     if (!event.type.startsWith("system.core_error")) {
       errorProtocol.report({ severity: "transient", scope: "cognition.event", message: `${event.type}: ${reason}` });
     }
@@ -5817,7 +6176,6 @@ async function startServer() {
   };
   const telegramBridge = new TelegramBridge({
     configPath: dataFile("telegram.json"),
-    getApiKey: () => getGeminiApiKey(),
     retrieveMemories: async (text) => {
       const recalled = await cognition.memories.retrieve({
         text,
@@ -5842,9 +6200,9 @@ async function startServer() {
       void processCognitiveEvent(event);
     },
     reportError: (severity, scope, message) => errorProtocol.report({ severity, scope, message }),
-    logCommand,
+    logCommand: logCommand2,
     logStartup,
-    logError,
+    logError: logError2,
     collectStatus: async () => {
       const agentAlive = await isDesktopAgentAlive();
       const situation = cognition.situation.getSnapshot();
@@ -5868,8 +6226,6 @@ async function startServer() {
       const now2 = Date.now();
       if (!isCritical && now2 - lastTelegramAlertAttemptAt < 12e4) return;
       lastTelegramAlertAttemptAt = now2;
-      const apiKey = getGeminiApiKey();
-      if (!apiKey) return;
       const meta = outcome.event.metadata ?? {};
       const observation = [
         typeof meta.thought === "string" ? meta.thought : "",
@@ -5877,7 +6233,6 @@ async function startServer() {
         typeof meta.activeWindow === "string" ? `window: ${meta.activeWindow}` : "",
         typeof meta.message === "string" ? meta.message : ""
       ].filter(Boolean).join(" | ") || type;
-      const client = new import_genai3.GoogleGenAI({ apiKey });
       const prompt = [
         "You are AMAYRA, a witty AI companion running on the user's Windows PC. The user is away from the app; this reaches their Telegram chat on their phone.",
         `Private observation: ${observation}`,
@@ -5885,15 +6240,15 @@ async function startServer() {
         "If it is not worth it, return exactly: SKIP",
         "Otherwise write ONE short natural line (at most two short sentences) in the user's style (Hinglish or English), no prefix, no quotes, no mention of monitoring or internal context."
       ].join("\n");
-      void client.models.generateContent({ model: "gemini-3.5-flash", contents: prompt }).then((response) => {
-        const text = (response.text ?? "").trim();
+      void generateTextWithFallback(prompt).then((result2) => {
+        const text = result2.text.trim();
         if (!text || /^SKIP$/i.test(text)) return;
         return telegramBridge.notifyOwner(`\u{1F514} ${text}`);
       }).catch((error) => {
-        logError(`TELEGRAM_ALERT_MODEL_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+        logError2(`TELEGRAM_ALERT_MODEL_FAILED: ${error instanceof Error ? error.message : String(error)}`);
       });
     } catch (error) {
-      logError(`TELEGRAM_ALERT_LISTENER_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+      logError2(`TELEGRAM_ALERT_LISTENER_FAILED: ${error instanceof Error ? error.message : String(error)}`);
     }
   });
   const desktopPerception = new DesktopPerception({
@@ -5958,7 +6313,7 @@ async function startServer() {
       const summary = await apiHub.sync(req.body?.force === true);
       res.json({ ...summary, metadata: apiHub.registry.getMetadata() });
     } catch (error) {
-      logError(`API_CATALOGUE_SYNC_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+      logError2(`API_CATALOGUE_SYNC_FAILED: ${error instanceof Error ? error.message : String(error)}`);
       res.status(502).json({ error: error instanceof Error ? error.message : String(error) });
     }
   });
@@ -5987,7 +6342,7 @@ async function startServer() {
     void apiHub.sync(false).then((summary) => {
       logStartup(`API_CATALOGUE_READY providers=${summary.providerCount} categories=${summary.categories}`);
     }).catch((error) => {
-      logError(`API_CATALOGUE_BACKGROUND_SYNC_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+      logError2(`API_CATALOGUE_BACKGROUND_SYNC_FAILED: ${error instanceof Error ? error.message : String(error)}`);
     });
   }
   app.post("/api/cognition/pause", async (req, res) => {
@@ -6186,15 +6541,15 @@ async function startServer() {
   const SETTINGS_FILE = dataFile("settings.json");
   function loadSettingsFile() {
     try {
-      if (fs10.existsSync(SETTINGS_FILE)) {
-        return JSON.parse(fs10.readFileSync(SETTINGS_FILE, "utf-8"));
+      if (fs11.existsSync(SETTINGS_FILE)) {
+        return JSON.parse(fs11.readFileSync(SETTINGS_FILE, "utf-8"));
       }
     } catch {
     }
     return {};
   }
   function saveSettingsFile(data) {
-    fs10.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2), "utf-8");
+    fs11.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2), "utf-8");
   }
   app.get("/api/settings", async (_req, res) => {
     try {
@@ -6216,15 +6571,15 @@ async function startServer() {
         callDesktopAgent(patch.autoStart ? "enableAutoStart" : "disableAutoStart", {}).catch(() => {
         });
       }
-      logCommand(`SETTINGS_UPDATED ${JSON.stringify(patch)}`);
+      logCommand2(`SETTINGS_UPDATED ${JSON.stringify(patch)}`);
       res.json(next);
     } catch (e) {
-      logError(`SETTINGS_SAVE_ERROR: ${e.message}`);
+      logError2(`SETTINGS_SAVE_ERROR: ${e.message}`);
       res.status(500).json({ error: e.message });
     }
   });
   app.get("/api/config", (_req, res) => {
-    res.json({ hasApiKey: hasGeminiApiKey() });
+    res.json({ hasApiKey: hasAnyProviderKey() });
   });
   app.post("/api/config/apikey", async (req, res) => {
     try {
@@ -6238,28 +6593,64 @@ async function startServer() {
         await pager[Symbol.asyncIterator]().next();
       } catch (e) {
         const msg = String(e?.message || e);
-        const isAuthError = /API[_ ]?KEY|PERMISSION_DENIED|UNAUTHENTICATED|invalid|401|403/i.test(msg);
-        if (isAuthError) {
-          logError(`APIKEY_VALIDATION_REJECTED: ${msg}`);
+        const isAuthError2 = /API[_ ]?KEY|PERMISSION_DENIED|UNAUTHENTICATED|invalid|401|403/i.test(msg);
+        if (isAuthError2) {
+          logError2(`APIKEY_VALIDATION_REJECTED: ${msg}`);
           return res.status(400).json({
             error: "That key was rejected by Google. Check it and try again."
           });
         }
-        logError(`APIKEY_VALIDATION_SOFT_FAIL (saving anyway): ${msg}`);
+        logError2(`APIKEY_VALIDATION_SOFT_FAIL (saving anyway): ${msg}`);
       }
       setGeminiApiKey(key);
-      logCommand("APIKEY_SAVED");
+      logCommand2("APIKEY_SAVED");
       res.json({ ok: true, hasApiKey: true });
     } catch (e) {
-      logError(`APIKEY_SAVE_ERROR: ${e?.message || e}`);
+      logError2(`APIKEY_SAVE_ERROR: ${e?.message || e}`);
       res.status(500).json({ error: e?.message || "Failed to save API key." });
     }
+  });
+  app.get("/api/config/providers", (_req, res) => {
+    res.json({ providers: describeProviderStatus() });
+  });
+  app.post("/api/config/providers/:provider/key", async (req, res) => {
+    try {
+      const provider = req.params.provider;
+      if (!PROVIDER_IDS.includes(provider)) {
+        return res.status(400).json({ error: "Unknown provider." });
+      }
+      const key = (req.body?.apiKey ?? "").toString().trim();
+      if (!key) return res.status(400).json({ error: "API key is required." });
+      const check = await checkProviderKey(provider, key);
+      if (check.authRejected) {
+        logError2(`PROVIDER_KEY_REJECTED ${provider}: ${check.message}`);
+        return res.status(400).json({
+          error: `${PROVIDER_LABELS[provider]} rejected that key. Check it and try again.`
+        });
+      }
+      setProviderKey(provider, key);
+      logCommand2(`PROVIDER_KEY_SAVED ${provider}${check.ok ? "" : " (validation soft-failed; saved anyway)"}`);
+      res.json({ ok: true, providers: describeProviderStatus() });
+    } catch (e) {
+      logError2(`PROVIDER_KEY_SAVE_ERROR: ${e?.message || e}`);
+      res.status(500).json({ error: e?.message || "Failed to save API key." });
+    }
+  });
+  app.delete("/api/config/providers/:provider/key", (req, res) => {
+    const provider = req.params.provider;
+    if (!PROVIDER_IDS.includes(provider)) {
+      return res.status(400).json({ error: "Unknown provider." });
+    }
+    clearProviderKey(provider);
+    logCommand2(`PROVIDER_KEY_CLEARED ${provider}`);
+    res.json({ ok: true, providers: describeProviderStatus() });
   });
   app.post("/chat", async (req, res) => {
     const prompt = (req.body?.prompt ?? "").toString().trim();
     if (!prompt) return res.status(400).json({ error: "prompt is required." });
-    const apiKey = getGeminiApiKey();
-    if (!apiKey) return res.status(503).json({ error: "No Gemini API key configured on the host." });
+    if (!hasAnyProviderKey()) {
+      return res.status(503).json({ error: "No model API key configured on the host." });
+    }
     try {
       const recalled = await cognition.memories.retrieve({
         text: prompt,
@@ -6268,14 +6659,13 @@ async function startServer() {
         minConfidence: 0.3
       }).catch(() => []);
       const memoryCard = recalled.length ? "\nRelevant memories: " + recalled.map((m) => m.content.slice(0, 100)).join(" | ") : "";
-      const client = new import_genai3.GoogleGenAI({ apiKey });
-      const result2 = await client.models.generateContent({
-        model: "gemini-3.5-flash",
-        contents: "You are AMAYRA, the user's warm, witty AI companion on their PC, replying to their phone. Match the user's language (Hinglish/Hindi/English). Keep it chat-short (1-4 sentences)." + memoryCard + "\nUser: " + prompt
-      });
-      const response = (result2.text ?? "").trim();
+      const result2 = await generateTextWithFallback(
+        "You are AMAYRA, the user's warm, witty AI companion on their PC, replying to their phone. Match the user's language (Hinglish/Hindi/English). Keep it chat-short (1-4 sentences)." + memoryCard + "\nUser: " + prompt,
+        { maxOutputTokens: 400 }
+      );
+      const response = result2.text.trim();
       if (!response) return res.status(502).json({ error: "Model returned an empty response." });
-      logCommand(`PHONE_CHAT len=${prompt.length} reply=${response.length}`);
+      logCommand2(`PHONE_CHAT len=${prompt.length} reply=${response.length}`);
       if (String(req.headers.accept || "").includes("text/event-stream")) {
         res.setHeader("Content-Type", "text/event-stream");
         res.write(`data: ${JSON.stringify({ delta: { content: response } })}
@@ -6287,7 +6677,7 @@ async function startServer() {
         res.json({ response });
       }
     } catch (e) {
-      logError(`PHONE_CHAT_FAILED: ${e?.message || e}`);
+      logError2(`PHONE_CHAT_FAILED: ${e?.message || e}`);
       res.status(500).json({ error: "AMAYRA could not answer right now." });
     }
   });
@@ -6301,7 +6691,7 @@ async function startServer() {
       await telegramBridge.setToken(token);
       res.json(telegramBridge.status());
     } catch (e) {
-      logError(`TELEGRAM_CONFIG_ERROR: ${e?.message || e}`);
+      logError2(`TELEGRAM_CONFIG_ERROR: ${e?.message || e}`);
       res.status(400).json({ error: e?.message || "Failed to configure the Telegram bot." });
     }
   });
@@ -6402,10 +6792,10 @@ async function startServer() {
         return res.status(400).json({ error: "Invalid log file. Use: commands, startup, errors, cognition, or model_history." });
       }
       const logPath = import_path2.default.join(LOGS_DIR, `${fileName}.log`);
-      if (!fs10.existsSync(logPath)) {
+      if (!fs11.existsSync(logPath)) {
         return res.json({ lines: [], file: fileName });
       }
-      const content = fs10.readFileSync(logPath, "utf-8");
+      const content = fs11.readFileSync(logPath, "utf-8");
       const lines = content.split("\n").filter(Boolean).slice(-100);
       res.json({ lines, file: fileName });
     } catch (e) {
@@ -7417,7 +7807,7 @@ ${presenceInstructions}`,
                 lastConsolidatedIndex = dialogueHistory.length;
                 (async () => {
                   try {
-                    const updated = await processConversationSlice(apiKey, unconsolidated);
+                    const updated = await processConversationSlice(unconsolidated);
                     if (updated) {
                       await cognition.memories.importLegacy(updated);
                       console.log("[Memory Sync] Sending refreshed memory list to client.");
@@ -7593,11 +7983,11 @@ A fresh screenshot is attached. Analyze it and answer the spoken question direct
                           capturedAt: Date.now()
                         });
                         if (injected) {
-                          logCommand(`SCREEN_VISION Frame injected from ${fc.name} (${payload?.width || "?"}x${payload?.height || "?"}).`);
+                          logCommand2(`SCREEN_VISION Frame injected from ${fc.name} (${payload?.width || "?"}x${payload?.height || "?"}).`);
                           console.log(`[ScreenVision] Frame injected from ${fc.name} (${payload?.width || "?"}x${payload?.height || "?"}).`);
                         }
                       } else if (fc.name === "viewScreen" || fc.args?.include_image) {
-                        logCommand(`SCREEN_VISION ${fc.name} did not return image bytes; model will rely on text.`);
+                        logCommand2(`SCREEN_VISION ${fc.name} did not return image bytes; model will rely on text.`);
                       }
                     }
                     session.sendToolResponse({
@@ -7622,7 +8012,7 @@ A fresh screenshot is attached. Analyze it and answer the spoken question direct
           onerror: (event) => {
             const details = String(event?.error?.message || event?.message || "Unknown Gemini Live error");
             console.error("Gemini Live session error:", details);
-            logError(`GEMINI_LIVE_ERROR: ${details}`);
+            logError2(`GEMINI_LIVE_ERROR: ${details}`);
             errorProtocol.report({
               severity: "degraded",
               scope: "geminiLive.session",
@@ -7643,7 +8033,7 @@ A fresh screenshot is attached. Analyze it and answer the spoken question direct
               console.log(`Gemini Live session closed (expected): ${details}`);
             } else {
               console.error("Gemini Live session closed:", details);
-              logError(`GEMINI_LIVE_CLOSED ${details}`);
+              logError2(`GEMINI_LIVE_CLOSED ${details}`);
               errorProtocol.report({
                 severity: "degraded",
                 scope: "geminiLive.session",
@@ -7681,7 +8071,7 @@ A fresh screenshot is attached. Analyze it and answer the spoken question direct
           session.sendRealtimeInput({ video: { data, mimeType } });
           lastSharedScreenFrameAt = Date.now();
         },
-        log: (line) => logCommand(`SCREEN_VISION ${line}`),
+        log: (line) => logCommand2(`SCREEN_VISION ${line}`),
         onStateChange: (state, info) => {
           try {
             clientWs.send(JSON.stringify({
@@ -8033,7 +8423,7 @@ The one-shot screen capture was unavailable. Say clearly that you could not acce
     stopAgentWatchdog();
     desktopPerception.stop();
     void cognition.shutdown().catch(
-      (error) => logError(`COGNITION_SHUTDOWN_FAILED: ${error instanceof Error ? error.message : String(error)}`)
+      (error) => logError2(`COGNITION_SHUTDOWN_FAILED: ${error instanceof Error ? error.message : String(error)}`)
     );
   };
   process.once("SIGTERM", shutdownCognition);

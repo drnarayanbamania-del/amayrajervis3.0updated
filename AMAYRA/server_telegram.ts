@@ -15,8 +15,14 @@
  *    unchanged. Confirmation-required actions are surfaced as /confirm <id>.
  */
 
-import { GoogleGenAI, Type } from "@google/genai";
-import type { Content, Part } from "@google/genai";
+import { Type } from "@google/genai";
+import {
+  generateTurnWithToolsFallback,
+  hasAnyProviderKey,
+  type GeminiStyleContents,
+  type ToolAwareTurn,
+  type ToolDeclaration,
+} from "./server_providers";
 import fs from "fs";
 import { randomUUID } from "node:crypto";
 
@@ -41,7 +47,6 @@ export interface TelegramToolOutcome {
 
 export interface TelegramBridgeOptions {
   configPath: string;
-  getApiKey: () => string | undefined;
   retrieveMemories(text: string): Promise<Array<{ text?: string }>>;
   executeTool(tool: string, args: Record<string, unknown>): Promise<TelegramToolOutcome>;
   confirmTool(confirmationId: string): Promise<unknown>;
@@ -256,12 +261,12 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-/** Map raw Gemini API failures (which can be a whole JSON blob) to a friendly, human reply. */
+/** Map raw model API failures (which can be a whole JSON blob) to a friendly, human reply. */
 function friendlyModelError(error: unknown): Error {
   const raw = error instanceof Error ? error.message : String(error);
-  if (/RESOURCE_EXHAUSTED|exceeded your current quota|\b429\b/i.test(raw)) {
+  if (/RESOURCE_EXHAUSTED|exceeded your current quota|\b429\b|All model providers failed/i.test(raw)) {
     return new Error(
-      "Gemini ka aaj ka free quota (20 requests) khatam ho gaya 😅 Quota midnight PT pe reset hota hai — ya phir Google AI Studio me billing enable karke limit bada sakte ho.",
+      "Sabhi model providers fail ho gaye 😅 (Gemini quota exhausted aur Groq/DeepSeek/OpenAI par bhi issue). Thodi der baad try karo, ya AMAYRA ke API Keys settings me ek aur key add karo.",
     );
   }
   return error instanceof Error ? error : new Error(raw);
@@ -589,17 +594,15 @@ export class TelegramBridge {
   }
 
   private async generateTurn(
-    client: GoogleGenAI,
-    contents: Content[],
-  ): Promise<Awaited<ReturnType<GoogleGenAI["models"]["generateContent"]>>> {
+    contents: GeminiStyleContents,
+  ): Promise<ToolAwareTurn> {
     try {
-      return await client.models.generateContent({
-        model: TEXT_MODEL,
+      // Provider fallback chain: Gemini native function calling first, then
+      // Groq/DeepSeek/OpenAI via the JSON tool protocol.
+      return await generateTurnWithToolsFallback({
         contents,
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          tools: [{ functionDeclarations: TELEGRAM_TOOLS }],
-        },
+        systemInstruction: SYSTEM_INSTRUCTION,
+        tools: TELEGRAM_TOOLS as ToolDeclaration[],
       });
     } catch (error) {
       throw friendlyModelError(error);
@@ -607,12 +610,10 @@ export class TelegramBridge {
   }
 
   private async handleConversation(msg: TelegramMessage, text: string): Promise<void> {
-    const apiKey = this.options.getApiKey();
-    if (!apiKey) {
-      await this.reply(msg.chat.id, "⚠️ No Gemini API key is configured on the core, so I can't think right now.");
+    if (!hasAnyProviderKey()) {
+      await this.reply(msg.chat.id, "⚠️ No model API key (Gemini/Groq/DeepSeek/OpenAI) is configured on the core, so I can't think right now.");
       return;
     }
-    const client = new GoogleGenAI({ apiKey });
 
     let memoryCard = "";
     try {
@@ -623,29 +624,29 @@ export class TelegramBridge {
     } catch { /* memory recall is best-effort */ }
 
     const history = this.historyFor(msg.chat.id);
-    const contents: Content[] = [
-      ...history.map((entry) => ({ role: entry.role, parts: [{ text: entry.text }] as Part[] })),
-      { role: "user" as const, parts: [{ text: text + memoryCard } as Part] },
+    const contents: GeminiStyleContents = [
+      ...history.map((entry) => ({ role: entry.role, parts: [{ text: entry.text }] })),
+      { role: "user" as const, parts: [{ text: text + memoryCard }] },
     ];
 
     let finalText = "";
     let pendingScreenshot: string | null = null;
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round += 1) {
-      const response = await this.generateTurn(client, contents);
-      const calls = response.functionCalls ?? [];
+      const response = await this.generateTurn(contents);
+      const calls = response.functionCalls;
       if (!calls.length) {
         finalText = response.text ?? "";
         break;
       }
       contents.push({
         role: "model",
-        parts: calls.map((call) => ({ functionCall: { name: call.name ?? "", args: call.args ?? {} } }) as Part),
+        parts: calls.map((call) => ({ functionCall: { name: call.name, args: call.args } })),
       });
-      const responseParts: Part[] = [];
+      const responseParts: GeminiStyleContents[number]["parts"] = [];
       for (const call of calls) {
-        const name = call.name ?? "";
-        const args = { ...(call.args ?? {}) } as Record<string, unknown>;
+        const name = call.name;
+        const args = { ...call.args } as Record<string, unknown>;
         let outcome: TelegramToolOutcome;
         if (name === "takeScreenshot") {
           args.include_image = true;
